@@ -1,248 +1,14 @@
 <?php
-session_start();
-if (!isset($_SESSION['instructor_id'])) { header('Location: instructor_login.php'); exit; }
-$instructor_id = (int)$_SESSION['instructor_id'];
-require_once '../includes/db.php';
-
-$today = date('Y-m-d');
-$selfFile = basename(__FILE__);
-
-function q($c,$s){return $c->query($s);}
-function esc($c,$v){return $c->real_escape_string($v);}
-$cColors=['TDC Face-to-Face'=>'tag-amber','TDC Online'=>'tag-blue',
-          'PDC Car Manual'=>'tag-green','PDC Car Automatic'=>'tag-teal',
-          'PDC Motorcycle Manual'=>'tag-coral','PDC Motorcycle Automatic'=>'tag-purple'];
-function stars($n){$s='';for($i=1;$i<=5;$i++)$s.=$i<=$n?'★':'☆';return $s;}
-
-$activeSection='dashboard';
-if(!empty($_GET['section']))$activeSection=preg_replace('/[^a-z_]/','',$_GET['section']);
-
-// ── POST handlers ─────────────────────────────────────────────
-if($_SERVER['REQUEST_METHOD']==='POST'){
-    $action=$_POST['action']??'';
-
-    // Approve / Reject appointment
-    if($action==='approve_appointment'){
-        $appt_id=(int)($_POST['appointment_id']??0);
-        $note=esc($conn,$_POST['instructor_note']??'');
-        $conn->query("UPDATE appointments SET status='approved',instructor_note='$note',reviewed_at=NOW() WHERE appointment_id=$appt_id AND instructor_id=$instructor_id AND status='pending'");
-        $aRow=q($conn,"SELECT a.*,s.student_id,ic.course_type FROM appointments a JOIN students s ON s.student_id=a.student_id JOIN instructor_courses ic ON ic.course_id=a.course_id WHERE a.appointment_id=$appt_id")->fetch_assoc();
-        if($aRow){$conn->query("INSERT INTO notifications (user_id,user_type,message,type) VALUES ({$aRow['student_id']},'student','Your appointment for {$aRow['course_type']} has been APPROVED!','appointment_approved')");}
-        $_SESSION['flash']='Appointment approved.';
-        header("Location: $selfFile?section=appointments"); exit;
-    }
-    if($action==='reject_appointment'){
-        $appt_id=(int)($_POST['appointment_id']??0);
-        $note=esc($conn,$_POST['instructor_note']??'');
-        $conn->query("UPDATE appointments SET status='rejected',instructor_note='$note',reviewed_at=NOW() WHERE appointment_id=$appt_id AND instructor_id=$instructor_id AND status='pending'");
-        $aRow=q($conn,"SELECT a.*,s.student_id,ic.course_type FROM appointments a JOIN students s ON s.student_id=a.student_id JOIN instructor_courses ic ON ic.course_id=a.course_id WHERE a.appointment_id=$appt_id")->fetch_assoc();
-        if($aRow){$conn->query("INSERT INTO notifications (user_id,user_type,message,type) VALUES ({$aRow['student_id']},'student','Your appointment for {$aRow['course_type']} was declined.','appointment_rejected')");}
-        $_SESSION['flash']='Appointment rejected.';
-        header("Location: $selfFile?section=appointments"); exit;
-    }
-
-    // Add session with grade
-    if($action==='add_session'){
-        $appt_id=(int)($_POST['appointment_id']??0);
-        $sess_date=esc($conn,$_POST['session_date']??$today);
-        $hrs=max(0.5,min(8,(float)($_POST['hours_covered']??1)));
-        $grade=(int)($_POST['grade']??0);
-        $grade=($grade>=1&&$grade<=100)?$grade:null;
-        $improvements=esc($conn,$_POST['improvements']??'');
-        $perf_notes=esc($conn,$_POST['performance_notes']??'');
-        $conn->query("UPDATE appointments SET status='in_progress' WHERE appointment_id=$appt_id AND instructor_id=$instructor_id AND status='approved'");
-        $aRow=q($conn,"SELECT * FROM appointments WHERE appointment_id=$appt_id AND instructor_id=$instructor_id")->fetch_assoc();
-        if($aRow){
-            $isTDC=q($conn,"SELECT course_type FROM instructor_courses WHERE course_id={$aRow['course_id']}")->fetch_assoc()['course_type'];
-            $sessType=stripos($isTDC,'TDC')===0?'TDC':'PDC';
-            $sessNum=(int)q($conn,"SELECT COUNT(*)+1 AS n FROM sessions WHERE appointment_id=$appt_id")->fetch_assoc()['n'];
-            $gradeSQL=$grade===null?'NULL':$grade;
-            $conn->query("INSERT INTO sessions (appointment_id,session_type,session_number,student_id,instructor_id,session_date,hours_covered,status,grade,improvements,performance_notes)
-                VALUES ($appt_id,'$sessType',$sessNum,{$aRow['student_id']},$instructor_id,'$sess_date',$hrs,'completed',$gradeSQL,'$improvements','$perf_notes')");
-            $doneHrs=(float)q($conn,"SELECT COALESCE(SUM(hours_covered),0) AS h FROM sessions WHERE appointment_id=$appt_id AND status='completed'")->fetch_assoc()['h'];
-            if($doneHrs>=$aRow['total_hours']){
-                $conn->query("UPDATE appointments SET status='completed',completed_at=NOW() WHERE appointment_id=$appt_id");
-                // Compute overall grade if TDC
-                if($sessType==='TDC'){
-                    $overallGrade=(float)q($conn,"SELECT ROUND(AVG(grade),1) AS ag FROM sessions WHERE appointment_id=$appt_id AND grade IS NOT NULL")->fetch_assoc()['ag'];
-                    if($overallGrade>0){
-                        $conn->query("UPDATE appointments SET tdc_overall_grade=ROUND($overallGrade) WHERE appointment_id=$appt_id");
-                    }
-                }
-                $conn->query("INSERT INTO notifications (user_id,user_type,message,type) VALUES ({$aRow['student_id']},'student','Your course is complete! Please rate your instructor.','course_completed')");
-            }
-        }
-        $_SESSION['flash']='Session logged.';
-        header("Location: $selfFile?section=appointments"); exit;
-    }
-
-    // Rate student performance for a session
-    if($action==='rate_student'){
-        $sess_id=(int)($_POST['session_id']??0);
-        $rating=max(1,min(5,(int)($_POST['performance_rating']??5)));
-        $notes=esc($conn,$_POST['performance_notes']??'');
-        $grade=(int)($_POST['grade']??0);
-        $grade=($grade>=1&&$grade<=100)?$grade:null;
-        $improvements=esc($conn,$_POST['improvements']??'');
-        $gradeSQL=$grade===null?'NULL':$grade;
-        $conn->query("UPDATE sessions SET performance_rating=$rating,performance_notes='$notes',grade=$gradeSQL,improvements='$improvements' WHERE session_id=$sess_id AND instructor_id=$instructor_id");
-        // Recalculate overall TDC grade if TDC session
-        $sessRow=q($conn,"SELECT s.*,ic.course_type FROM sessions s JOIN appointments a ON a.appointment_id=s.appointment_id JOIN instructor_courses ic ON ic.course_id=a.course_id WHERE s.session_id=$sess_id")->fetch_assoc();
-        if($sessRow&&stripos($sessRow['course_type'],'TDC')===0){
-            $overallGrade=(float)q($conn,"SELECT ROUND(AVG(grade),1) AS ag FROM sessions WHERE appointment_id={$sessRow['appointment_id']} AND grade IS NOT NULL")->fetch_assoc()['ag'];
-            if($overallGrade>0)$conn->query("UPDATE appointments SET tdc_overall_grade=ROUND($overallGrade) WHERE appointment_id={$sessRow['appointment_id']}");
-        }
-        $_SESSION['flash']='Session updated.';
-        header("Location: $selfFile?section=performance"); exit;
-    }
-
-    // Issue TDC certificate with delivery method
-    if($action==='issue_certificate'){
-        $appt_id=(int)($_POST['appointment_id']??0);
-        $cert_num=esc($conn,$_POST['cert_number']??'');
-        $delivery=in_array($_POST['delivery_method']??'',['online','face_to_face'])?$_POST['delivery_method']:'face_to_face';
-        $aRow=q($conn,"SELECT * FROM appointments WHERE appointment_id=$appt_id AND instructor_id=$instructor_id AND status='completed'")->fetch_assoc();
-        if($aRow){
-            // Handle uploaded cert image for online delivery
-            $certImage='NULL';
-            if($delivery==='online'&&isset($_FILES['cert_image'])&&$_FILES['cert_image']['error']===0){
-                $ext=strtolower(pathinfo($_FILES['cert_image']['name'],PATHINFO_EXTENSION));
-                if(in_array($ext,['jpg','jpeg','png','gif','webp'])){
-                    $uploadPath='../assets/uploads/certs/';
-                    if(!is_dir($uploadPath))mkdir($uploadPath,0755,true);
-                    $fname='tcert_'.$aRow['student_id'].'_'.time().'.'.$ext;
-                    if(move_uploaded_file($_FILES['cert_image']['tmp_name'],$uploadPath.$fname)){
-                        $certImage="'$fname'";
-                    }
-                }
-            }
-            $conn->query("INSERT IGNORE INTO tdc_certificates (student_id,appointment_id,issued_by,cert_number,delivery_method,cert_image) VALUES ({$aRow['student_id']},$appt_id,$instructor_id,'$cert_num','$delivery',$certImage)");
-            $msg=$delivery==='online'?'Your TDC Certificate has been issued online! PDC is now unlocked.':'Your TDC Certificate is ready! Please collect it in person. PDC is now unlocked.';
-            $conn->query("INSERT INTO notifications (user_id,user_type,message,type) VALUES ({$aRow['student_id']},'student','$msg','certificate_issued')");
-        }
-        $_SESSION['flash']='Certificate issued.';
-        header("Location: $selfFile?section=performance"); exit;
-    }
-
-    // Manage courses
-    if($action==='add_course'){
-        $ct=esc($conn,$_POST['course_type']??'');
-        $desc=esc($conn,$_POST['description']??'');
-        $phr=(float)($_POST['price_per_hr']??0);
-        $conn->query("INSERT INTO instructor_courses (instructor_id,course_type,description,price_per_hr) VALUES ($instructor_id,'$ct','$desc',$phr)");
-        $_SESSION['flash']='Course added.';
-        header("Location: $selfFile?section=courses"); exit;
-    }
-    if($action==='toggle_course'){
-        $cid=(int)($_POST['course_id']??0);
-        $conn->query("UPDATE instructor_courses SET is_active=1-is_active WHERE course_id=$cid AND instructor_id=$instructor_id");
-        header("Location: $selfFile?section=courses"); exit;
-    }
-    if($action==='delete_course'){
-        $cid=(int)($_POST['course_id']??0);
-        $conn->query("DELETE FROM instructor_courses WHERE course_id=$cid AND instructor_id=$instructor_id");
-        header("Location: $selfFile?section=courses"); exit;
-    }
-
-    // Update profile
-    if($action==='update_profile'){
-        $name=esc($conn,$_POST['fullname']??'');
-        $email=esc($conn,$_POST['email']??'');
-        $mobile=esc($conn,$_POST['mobile']??'');
-        $bio=esc($conn,$_POST['bio']??'');
-        // Handle certificate upload
-        $certSQL='';
-        if(isset($_FILES['certificate_image'])&&$_FILES['certificate_image']['error']===0){
-            $ext=strtolower(pathinfo($_FILES['certificate_image']['name'],PATHINFO_EXTENSION));
-            if(in_array($ext,['jpg','jpeg','png','gif','webp','pdf'])){
-                $uploadPath='../assets/uploads/certificates/';
-                if(!is_dir($uploadPath))mkdir($uploadPath,0755,true);
-                $fname='cert_'.$instructor_id.'_'.time().'.'.$ext;
-                if(move_uploaded_file($_FILES['certificate_image']['tmp_name'],$uploadPath.$fname)){
-                    $certSQL=",certificate_image='$fname'";
-                }
-            }
-        }
-        $conn->query("UPDATE instructors SET fullname='$name',email='$email',mobile='$mobile',bio='$bio',modified_date=NOW()$certSQL WHERE instructor_id=$instructor_id");
-        $_SESSION['flash']='Profile updated.';
-        header("Location: $selfFile?section=profile"); exit;
-    }
-
-    // Mark notifications read
-    if($action==='mark_read'){
-        $conn->query("UPDATE notifications SET is_read=1 WHERE user_id=$instructor_id AND user_type='instructor'");
-        header("Location: $selfFile?section=messages"); exit;
-    }
-}
-
-// ── data ──────────────────────────────────────────────────────
-$instructor=q($conn,"SELECT * FROM instructors WHERE instructor_id=$instructor_id")->fetch_assoc();
-$unreadCnt=(int)q($conn,"SELECT COUNT(*) AS c FROM notifications WHERE user_id=$instructor_id AND user_type='instructor' AND is_read=0")->fetch_assoc()['c'];
-
-$pendingAppts=q($conn,"
-    SELECT a.*,ic.course_type,s.fullname AS sname,s.email AS semail
-    FROM appointments a
-    JOIN instructor_courses ic ON ic.course_id=a.course_id
-    JOIN students s ON s.student_id=a.student_id
-    WHERE a.instructor_id=$instructor_id AND a.status='pending'
-    ORDER BY a.start_date ASC, a.requested_at ASC
-");
-
-$allAppts=q($conn,"
-    SELECT a.*,ic.course_type,s.fullname AS sname,
-           (SELECT SUM(hours_covered) FROM sessions WHERE appointment_id=a.appointment_id AND status='completed') AS hours_done,
-           tc.cert_id
-    FROM appointments a
-    JOIN instructor_courses ic ON ic.course_id=a.course_id
-    JOIN students s ON s.student_id=a.student_id
-    LEFT JOIN tdc_certificates tc ON tc.appointment_id=a.appointment_id
-    WHERE a.instructor_id=$instructor_id
-    ORDER BY a.start_date DESC, a.requested_at DESC
-");
-
-$myStudents=q($conn,"
-    SELECT DISTINCT s.student_id,s.fullname,s.email,
-        (SELECT ic.course_type FROM appointments a2 JOIN instructor_courses ic ON ic.course_id=a2.course_id
-         WHERE a2.instructor_id=$instructor_id AND a2.student_id=s.student_id ORDER BY a2.requested_at DESC LIMIT 1) AS latest_course,
-        (SELECT a3.status FROM appointments a3 WHERE a3.instructor_id=$instructor_id AND a3.student_id=s.student_id ORDER BY a3.requested_at DESC LIMIT 1) AS latest_status
-    FROM students s
-    WHERE EXISTS(SELECT 1 FROM appointments a WHERE a.instructor_id=$instructor_id AND a.student_id=s.student_id AND a.status IN('approved','in_progress','completed','pending'))
-    ORDER BY s.fullname ASC
-");
-
-$unratedSessions=q($conn,"
-    SELECT sess.*,a.course_id,ic.course_type,s.fullname AS sname
-    FROM sessions sess
-    JOIN appointments a ON a.appointment_id=sess.appointment_id
-    JOIN instructor_courses ic ON ic.course_id=a.course_id
-    JOIN students s ON s.student_id=sess.student_id
-    WHERE sess.instructor_id=$instructor_id AND sess.status='completed' AND (sess.performance_rating IS NULL OR sess.grade IS NULL)
-    AND ic.course_type LIKE 'TDC%'
-    ORDER BY sess.session_date DESC
-");
-
-$myCourses=q($conn,"SELECT * FROM instructor_courses WHERE instructor_id=$instructor_id ORDER BY course_type");
-$notifs=q($conn,"SELECT * FROM notifications WHERE user_id=$instructor_id AND user_type='instructor' ORDER BY created_at DESC LIMIT 30");
-
-$statPending=(int)q($conn,"SELECT COUNT(*) AS c FROM appointments WHERE instructor_id=$instructor_id AND status='pending'")->fetch_assoc()['c'];
-$statActive=(int)q($conn,"SELECT COUNT(*) AS c FROM appointments WHERE instructor_id=$instructor_id AND status IN('approved','in_progress')")->fetch_assoc()['c'];
-$statDone=(int)q($conn,"SELECT COUNT(*) AS c FROM appointments WHERE instructor_id=$instructor_id AND status='completed'")->fetch_assoc()['c'];
-$avgRating=q($conn,"SELECT ROUND(AVG(rating),1) AS r FROM instructor_ratings WHERE instructor_id=$instructor_id")->fetch_assoc()['r'];
-
-// Top 5 students by grade for this instructor
-$topStudents=q($conn,"SELECT s.student_id,s.fullname,ROUND(AVG(sess.grade),1) AS avg_grade,COUNT(sess.session_id) AS sess_cnt FROM sessions sess JOIN students s ON s.student_id=sess.student_id WHERE sess.instructor_id=$instructor_id AND sess.grade IS NOT NULL AND DATE_FORMAT(sess.session_date,'%Y-%m')=DATE_FORMAT(NOW(),'%Y-%m') GROUP BY s.student_id ORDER BY avg_grade DESC LIMIT 5");
-
-$flash=$_SESSION['flash']??null; unset($_SESSION['flash']);
-$scmS=['pending'=>'bkp','approved'=>'bksu','in_progress'=>'bkb','completed'=>'bkg','rejected'=>'bkr','cancelled'=>'bkd'];
-$scmL=['pending'=>'Pending','approved'=>'Approved','in_progress'=>'In Progress','completed'=>'Completed','rejected'=>'Rejected','cancelled'=>'Cancelled'];
-$uploadDir='../assets/uploads/certificates/';
-$courseTypeOpts=['TDC Face-to-Face','TDC Online','PDC Car Manual','PDC Car Automatic','PDC Motorcycle Manual','PDC Motorcycle Automatic'];
+require_once 'instructor_backend.php';
+// Add missing sidebar stat
+$sbPdcCertsIssued=(int)q($conn,"SELECT COUNT(*) AS c FROM pdc_certificates WHERE issued_by=$instructor_id")->fetch_assoc()['c'];
+$sbTotalSess=(int)q($conn,"SELECT COUNT(*) AS c FROM sessions WHERE instructor_id=$instructor_id AND status='completed'")->fetch_assoc()['c'];
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Instructor Dashboard – ABROT</title>
+<title>Instructor Dashboard – MotoSafe Driving School</title>
 <link href="../assets/img/logo.png" rel="icon">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.2/css/bootstrap.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
@@ -250,13 +16,13 @@ $courseTypeOpts=['TDC Face-to-Face','TDC Online','PDC Car Manual','PDC Car Autom
 :root{--bg:#0f1117;--bg2:#181c27;--bg3:#1e2436;--border:#2a3147;--accent:#7c6af7;--green:#3cb97a;--amber:#f59e0b;--red:#e55;--text:#e2e5f0;--muted:#8490a8}
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;min-height:100vh;display:flex}
-.sidebar{width:220px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:20px 0;flex-shrink:0;position:fixed;height:100vh;overflow-y:auto;z-index:100}
+.sidebar{width:240px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:20px 0;flex-shrink:0;position:fixed;height:100vh;overflow-y:auto;z-index:100}
 .brand{padding:0 18px 20px;font-size:15px;font-weight:700;color:var(--accent);border-bottom:1px solid var(--border);margin-bottom:12px}
 .nav-item{display:flex;align-items:center;gap:10px;padding:10px 18px;color:var(--muted);font-size:13px;cursor:pointer;text-decoration:none;border:none;background:none;width:100%;text-align:left;transition:.15s}
 .nav-item:hover,.nav-item.active{background:rgba(124,106,247,.12);color:var(--text)}
 .nav-item.active{border-left:3px solid var(--accent);color:var(--accent)}
 .nav-item i{width:16px;text-align:center}
-.main{margin-left:220px;flex:1;padding:24px;min-height:100vh}
+.main{margin-left:240px;flex:1;padding:24px;min-height:100vh}
 .page-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
 .page-title{font-size:18px;font-weight:600}
 .section{display:none}.section.active{display:block}
@@ -267,6 +33,8 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
 .stat-card{background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:16px;cursor:pointer}
 .stat-num{font-size:26px;font-weight:700;color:var(--accent)}
 .stat-label{font-size:11px;color:var(--muted);margin-top:4px}
+.duo-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+@media(max-width:900px){.duo-grid{grid-template-columns:1fr}}
 .tag{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:500}
 .tag-amber{background:rgba(245,158,11,.15);color:#f59e0b}.tag-blue{background:rgba(59,130,246,.15);color:#60a5fa}
 .tag-green{background:rgba(59,185,122,.15);color:#3cb97a}.tag-teal{background:rgba(20,184,166,.15);color:#2dd4bf}
@@ -296,9 +64,16 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
 .prog-fill{height:100%;background:var(--accent);border-radius:4px}
 .cert-badge{background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.3);color:#f59e0b;padding:4px 10px;border-radius:20px;font-size:11px;display:inline-flex;align-items:center;gap:5px}
 .profile-avatar{width:72px;height:72px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:700;color:#fff;flex-shrink:0}
-.grade-chip{display:inline-flex;align-items:center;justify-content:center;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:600}
 .grade-bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden;margin-top:3px}
 .grade-fill{height:100%;border-radius:3px}
+.sb-analytics{padding:14px 14px 0;border-top:1px solid var(--border);margin-top:8px}
+.sb-analytics-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.sb-stat{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid rgba(42,49,71,.5)}
+.sb-stat:last-child{border-bottom:none}
+.sb-stat-label{font-size:11px;color:var(--muted)}
+.sb-stat-val{font-size:12px;font-weight:700;color:var(--text)}
+.sb-mini-bar{height:4px;background:var(--border);border-radius:2px;overflow:hidden;margin-top:3px;width:70px}
+.sb-mini-fill{height:100%;border-radius:2px;background:var(--accent)}
 </style>
 </head>
 <body>
@@ -309,7 +84,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
     <a class="nav-item <?= $activeSection==='appointments'?'active':'' ?>" onclick="showSection('appointments')" href="#">
         <i class="fa-solid fa-calendar-check"></i> Appointments
         <?php if($statPending>0): ?><span class="tag tag-amber"><?= $statPending ?></span><?php endif; ?></a>
-    <a class="nav-item <?= $activeSection==='students'?'active':'' ?>" onclick="showSection('students')" href="#">
+    <a class="nav-item <?= in_array($activeSection,['students','student_profile'])?'active':'' ?>" onclick="showSection('students')" href="#">
         <i class="fa-solid fa-users"></i> My Students</a>
     <a class="nav-item <?= $activeSection==='performance'?'active':'' ?>" onclick="showSection('performance')" href="#">
         <i class="fa-solid fa-star"></i> Performance
@@ -319,10 +94,25 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
     <a class="nav-item <?= $activeSection==='messages'?'active':'' ?>" onclick="showSection('messages')" href="#">
         <i class="fa-solid fa-bell"></i> Notifications
         <?php if($unreadCnt>0): ?><span class="tag tag-amber"><?= $unreadCnt ?></span><?php endif; ?></a>
+    <a class="nav-item <?= in_array($activeSection,['chat'])?'active':'' ?>" onclick="showSection('chat')" href="#">
+        <i class="fa-solid fa-comments"></i> Messages
+        <?php if($totalUnreadMsg>0): ?><span class="tag tag-blue"><?= $totalUnreadMsg ?></span><?php endif; ?></a>
     <a class="nav-item <?= $activeSection==='profile'?'active':'' ?>" onclick="showSection('profile')" href="#">
         <i class="fa-solid fa-user-circle"></i> Profile</a>
     <div style="flex:1"></div>
-    <a class="nav-item" href="instructor_logout.php"><i class="fa-solid fa-sign-out-alt"></i> Logout</a>
+
+    <?php $sbRatColor=$avgRating>=4?'#3cb97a':($avgRating>=3?'#f59e0b':'#e55'); ?>
+    <div class="sb-analytics">
+        <div class="sb-analytics-title"><i class="fa-solid fa-chart-line" style="color:var(--accent)"></i> My Stats</div>
+        <div class="sb-stat"><div class="sb-stat-label">My Rating</div><div class="sb-stat-val" style="color:<?= $sbRatColor ?>">★ <?= $avgRating ?: '—' ?></div></div>
+        <div class="sb-stat"><div class="sb-stat-label">Total Students</div><div class="sb-stat-val" style="color:var(--accent)"><?= $sbTotalStudents ?></div></div>
+        <div class="sb-stat"><div class="sb-stat-label">Hours Taught</div><div class="sb-stat-val"><?= $sbTotalHrsTaught ?>h</div></div>
+        <div class="sb-stat"><div class="sb-stat-label">This Month</div><div class="sb-stat-val" style="color:var(--amber)"><?= $sbMonthHrs ?>h</div></div>
+        <div class="sb-stat"><div class="sb-stat-label">Total Sessions</div><div class="sb-stat-val"><?= $sbTotalSess ?></div></div>
+        <div class="sb-stat"><div class="sb-stat-label">TDC Certs Issued</div><div class="sb-stat-val" style="color:var(--amber)"><?= $sbCertsIssued ?></div></div>
+        <div class="sb-stat"><div class="sb-stat-label">PDC Certs Issued</div><div class="sb-stat-val" style="color:var(--green)"><?= $sbPdcCertsIssued ?></div></div>
+    </div>
+    <a class="nav-item" href="../instructor_logout.php"><i class="fa-solid fa-sign-out-alt"></i> Logout</a>
 </div>
 
 <div class="main">
@@ -393,6 +183,32 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
     </tbody></table>
 </div>
 <?php endif; ?>
+
+<!-- Analytics Charts -->
+<div style="font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin:20px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--border)">
+    <i class="fa-solid fa-chart-line me-2" style="color:var(--accent)"></i>My Performance Analytics
+</div>
+<div class="duo-grid" style="margin-bottom:16px">
+    <div class="panel">
+        <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-chart-area me-1"></i> Hours Taught – Last 6 Months</div></div>
+        <div style="padding:16px;height:200px;position:relative"><canvas id="instrChartHours"></canvas></div>
+    </div>
+    <div class="panel">
+        <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-chart-pie me-1"></i> TDC vs PDC Sessions</div></div>
+        <div style="padding:16px;display:flex;align-items:center;gap:20px;height:200px">
+            <div style="flex:0 0 150px;height:150px;position:relative"><canvas id="instrChartSplit"></canvas></div>
+            <div style="flex:1;font-size:12px;display:flex;flex-direction:column;gap:12px">
+                <div><div style="color:var(--amber);font-weight:700;font-size:18px"><?= $instrTDCSess ?></div><div style="color:var(--muted);font-size:11px">TDC Sessions</div></div>
+                <div><div style="color:var(--green);font-weight:700;font-size:18px"><?= $instrPDCSess ?></div><div style="color:var(--muted);font-size:11px">PDC Sessions</div></div>
+                <div><div style="color:var(--accent);font-weight:700;font-size:18px"><?= $instrTDCSess+$instrPDCSess ?></div><div style="color:var(--muted);font-size:11px">Total Sessions</div></div>
+            </div>
+        </div>
+    </div>
+</div>
+<div class="panel" style="margin-bottom:16px">
+    <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-chart-bar me-1"></i> My Students' Grade Distribution</div></div>
+    <div style="padding:16px;height:200px;position:relative"><canvas id="instrChartGrades"></canvas></div>
+</div>
 </div>
 
 <!-- ══ APPOINTMENTS ═══════════════════════════════════════════ -->
@@ -435,7 +251,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
             </button>
             <?php endif; ?>
             <?php if($ap['status']==='completed' && $isTDC && !$ap['cert_id']): ?>
-            <button class="be" style="font-size:10px;background:var(--amber);color:#000" onclick="openCertModal(<?= $ap['appointment_id'] ?>, '<?= addslashes($ap['sname']) ?>')">
+            <button class="be" style="font-size:10px;background:var(--amber);color:#000" onclick="openCertModal(<?= $ap['appointment_id'] ?>,'<?= addslashes($ap['sname']) ?>')">
                 <i class="fa-solid fa-certificate"></i> Issue Cert
             </button>
             <?php endif; ?>
@@ -463,10 +279,10 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
 
 <div class="panel">
     <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-users"></i> My Students</div></div>
-    <table class="tbl"><thead><tr><th>Student</th><th>Email</th><th>Latest Course</th><th>Status</th><th>Sessions</th><th>Avg Grade</th></tr></thead><tbody>
+    <table class="tbl"><thead><tr><th>Student</th><th>Email</th><th>Latest Course</th><th>Status</th><th>Sessions</th><th>Avg Grade</th><th>Action</th></tr></thead><tbody>
     <?php $myStudents->data_seek(0); if($myStudents->num_rows===0): ?>
-    <tr><td colspan="6" style="color:var(--muted);text-align:center;padding:24px">No students yet.</td></tr>
-    <?php else: while($st=$myStudents->fetch_assoc()): $tc=$cColors[$st['latest_course']??'']??'tag-gray'; 
+    <tr><td colspan="7" style="color:var(--muted);text-align:center;padding:24px">No students yet.</td></tr>
+    <?php else: while($st=$myStudents->fetch_assoc()): $tc=$cColors[$st['latest_course']??'']??'tag-gray';
         $avgG=q($conn,"SELECT ROUND(AVG(grade),1) AS ag FROM sessions WHERE student_id={$st['student_id']} AND instructor_id=$instructor_id AND grade IS NOT NULL")->fetch_assoc()['ag'];
         $gc=$avgG?($avgG>=80?'var(--green)':($avgG>=60?'var(--amber)':'var(--red)')):''; ?>
     <tr>
@@ -476,10 +292,183 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
         <td><span class="<?= $scmS[$st['latest_status']??'']??'bkd' ?>"><?= $scmL[$st['latest_status']??'']??'—' ?></span></td>
         <td><?php $sessCnt=(int)q($conn,"SELECT COUNT(*) AS c FROM sessions WHERE student_id={$st['student_id']} AND instructor_id=$instructor_id")->fetch_assoc()['c']; ?><?= $sessCnt ?> session<?= $sessCnt!=1?'s':'' ?></td>
         <td><?= $avgG?'<strong style="color:'.$gc.'">'.$avgG.'/100</strong>':'—' ?></td>
+        <td><a href="<?= $selfFile ?>?section=student_profile&view_student=<?= $st['student_id'] ?>" class="bds" style="font-size:11px;white-space:nowrap"><i class="fa-solid fa-eye me-1"></i>View Profile</a></td>
     </tr>
     <?php endwhile; endif; ?>
     </tbody></table>
 </div>
+</div>
+
+<!-- ══ STUDENT PROFILE ══════════════════════════════════════ -->
+<div id="section-student_profile" class="section <?= $activeSection==='student_profile'?'active':'' ?>">
+<?php if($viewStudentId>0):
+    $vStu=q($conn,"SELECT * FROM students WHERE student_id=$viewStudentId")->fetch_assoc();
+    $enrolled=(int)q($conn,"SELECT COUNT(*) AS c FROM appointments WHERE student_id=$viewStudentId AND instructor_id=$instructor_id")->fetch_assoc()['c'];
+    if($vStu&&$enrolled>0):
+    $stuAppts=q($conn,"SELECT a.*,ic.course_type,
+        (SELECT SUM(hours_covered) FROM sessions WHERE appointment_id=a.appointment_id AND status='completed') AS hours_done,
+        (SELECT COUNT(*) FROM sessions WHERE appointment_id=a.appointment_id AND status='completed') AS sess_count,
+        (SELECT ROUND(AVG(grade),1) FROM sessions WHERE appointment_id=a.appointment_id AND grade IS NOT NULL) AS avg_grade,
+        tc.cert_number,tc.issued_at AS cert_issued
+        FROM appointments a
+        JOIN instructor_courses ic ON ic.course_id=a.course_id
+        LEFT JOIN tdc_certificates tc ON tc.appointment_id=a.appointment_id
+        WHERE a.student_id=$viewStudentId AND a.instructor_id=$instructor_id
+        ORDER BY a.requested_at DESC");
+    $stuSess=q($conn,"SELECT sess.*,ic.course_type FROM sessions sess
+        JOIN appointments a ON a.appointment_id=sess.appointment_id
+        JOIN instructor_courses ic ON ic.course_id=a.course_id
+        WHERE sess.student_id=$viewStudentId AND sess.instructor_id=$instructor_id
+        ORDER BY sess.session_date DESC");
+    $stuRating=q($conn,"SELECT * FROM instructor_ratings WHERE student_id=$viewStudentId AND instructor_id=$instructor_id ORDER BY rated_at DESC LIMIT 1")->fetch_assoc();
+?>
+<div style="margin-bottom:12px">
+    <a href="<?= $selfFile ?>?section=students" class="bds" style="font-size:12px"><i class="fa-solid fa-arrow-left me-1"></i> Back to My Students</a>
+</div>
+
+<?php
+$spHasTDC_i=(int)q($conn,"SELECT COUNT(*) AS c FROM tdc_certificates WHERE student_id=$viewStudentId")->fetch_assoc()['c'];
+$spHasPDC_i=(int)q($conn,"SELECT COUNT(*) AS c FROM pdc_certificates WHERE student_id=$viewStudentId")->fetch_assoc()['c'];
+$spIdPath_i='../assets/uploads/student_ids/';
+$totalSess=(int)q($conn,"SELECT COUNT(*) AS c FROM sessions WHERE student_id=$viewStudentId AND instructor_id=$instructor_id AND status='completed'")->fetch_assoc()['c'];
+$totalHrs=(float)q($conn,"SELECT COALESCE(SUM(hours_covered),0) AS h FROM sessions WHERE student_id=$viewStudentId AND instructor_id=$instructor_id AND status='completed'")->fetch_assoc()['h'];
+$overallAvg=q($conn,"SELECT ROUND(AVG(grade),1) AS ag FROM sessions WHERE student_id=$viewStudentId AND instructor_id=$instructor_id AND grade IS NOT NULL")->fetch_assoc()['ag'];
+$gc=$overallAvg?($overallAvg>=80?'var(--green)':($overallAvg>=60?'var(--amber)':'var(--red)')):'var(--muted)';
+?>
+<div class="panel" style="margin-bottom:16px">
+    <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-user-graduate me-1"></i><?= htmlspecialchars($vStu['fullname']) ?></div></div>
+    <div style="padding:16px;display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap">
+        <!-- Avatar -->
+        <div style="width:64px;height:64px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:700;color:#fff;flex-shrink:0"><?= strtoupper(substr($vStu['fullname'],0,1)) ?></div>
+        <!-- Info grid -->
+        <div style="flex:1;min-width:260px;display:grid;grid-template-columns:1fr 1fr;gap:12px">
+            <div><span style="font-size:11px;color:var(--muted)">Email</span><div style="font-size:13px"><?= htmlspecialchars($vStu['email']) ?></div></div>
+            <div><span style="font-size:11px;color:var(--muted)">Mobile</span><div style="font-size:13px"><?= !empty($vStu['mobile'])?htmlspecialchars($vStu['mobile']):'—' ?></div></div>
+            <div><span style="font-size:11px;color:var(--muted)">Gender</span><div style="font-size:13px"><?php if(!empty($vStu['gender'])): ?><i class="fa-solid fa-<?= $vStu['gender']==='Male'?'mars':($vStu['gender']==='Female'?'venus':'genderless') ?> me-1" style="color:<?= $vStu['gender']==='Male'?'#60a5fa':'#f472b6' ?>"></i><?= htmlspecialchars($vStu['gender']) ?><?php else: ?>—<?php endif; ?></div></div>
+            <div><span style="font-size:11px;color:var(--muted)">Verified</span><div><?= $vStu['is_verified']?'<span class="bkg">Yes</span>':'<span class="bkp">No</span>' ?></div></div>
+            <div><span style="font-size:11px;color:var(--muted)">Address</span><div style="font-size:12px"><?= !empty($vStu['address'])?htmlspecialchars($vStu['address']):'—' ?></div></div>
+            <div><span style="font-size:11px;color:var(--muted)">Joined</span><div style="font-size:13px"><?= date('F d, Y',strtotime($vStu['created_at'])) ?></div></div>
+            <div><span style="font-size:11px;color:var(--muted)">Facebook</span><div style="font-size:12px"><?php if(!empty($vStu['fb_link'])): ?><a href="<?= htmlspecialchars($vStu['fb_link']) ?>" target="_blank" style="color:#60a5fa;text-decoration:none"><i class="fa-brands fa-facebook me-1"></i>View Profile</a><?php else: ?>—<?php endif; ?></div></div>
+            <div><span style="font-size:11px;color:var(--muted)">Certificates</span><div style="display:flex;gap:6px;margin-top:3px;flex-wrap:wrap"><?php if($spHasTDC_i): ?><span class="cert-badge"><i class="fa-solid fa-certificate"></i> TDC</span><?php endif; ?><?php if($spHasPDC_i): ?><span class="cert-badge" style="color:var(--green)"><i class="fa-solid fa-certificate"></i> PDC</span><?php endif; ?><?php if(!$spHasTDC_i&&!$spHasPDC_i): ?>—<?php endif; ?></div></div>
+        </div>
+        <!-- ID Photo -->
+        <div style="flex-shrink:0;text-align:center">
+            <div style="font-size:10px;color:var(--muted);margin-bottom:8px"><i class="fa-solid fa-id-card me-1"></i>National ID / Valid ID</div>
+            <?php if(!empty($vStu['id_photo'])&&file_exists($spIdPath_i.$vStu['id_photo'])): ?>
+            <img src="<?= $spIdPath_i.htmlspecialchars($vStu['id_photo']) ?>" style="max-width:200px;max-height:120px;border-radius:8px;border:2px solid var(--border);object-fit:cover;display:block;cursor:pointer;transition:.15s" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">
+            <div style="display:flex;gap:6px;margin-top:6px;justify-content:center">
+                <a href="<?= 'view_image.php?type=student_ids&file='.urlencode($vStu['id_photo']).'&back='.urlencode($_SERVER['REQUEST_URI']) ?>" class="bds" style="font-size:11px"><i class="fa-solid fa-eye me-1"></i>View</a>
+            </div>
+            <?php else: ?>
+            <div style="width:160px;height:100px;border:2px dashed var(--border);border-radius:8px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px">
+                <i class="fa-solid fa-id-card" style="font-size:22px;color:var(--border)"></i>
+                <span style="font-size:11px;color:var(--muted)">No ID uploaded</span>
+            </div>
+            <?php endif; ?>
+        </div>
+    </div>
+    <!-- Quick stats row -->
+    <div style="padding:12px 16px;border-top:1px solid var(--border);display:flex;gap:12px;flex-wrap:wrap">
+        <div style="background:var(--bg3);border-radius:10px;padding:10px 18px;text-align:center;min-width:80px"><div style="font-size:20px;font-weight:700;color:var(--accent)"><?= $totalSess ?></div><div style="font-size:10px;color:var(--muted)">Sessions</div></div>
+        <div style="background:var(--bg3);border-radius:10px;padding:10px 18px;text-align:center;min-width:80px"><div style="font-size:20px;font-weight:700;color:var(--green)"><?= $totalHrs ?></div><div style="font-size:10px;color:var(--muted)">Hours</div></div>
+        <div style="background:var(--bg3);border-radius:10px;padding:10px 18px;text-align:center;min-width:80px"><div style="font-size:20px;font-weight:700;color:<?= $gc ?>"><?= $overallAvg??'—' ?></div><div style="font-size:10px;color:var(--muted)">Avg Grade</div></div>
+        <?php if($stuRating): ?><div style="background:var(--bg3);border-radius:10px;padding:10px 18px;text-align:center;min-width:80px"><div style="font-size:20px;font-weight:700;color:var(--amber)"><?= $stuRating['rating'] ?>★</div><div style="font-size:10px;color:var(--muted)">Their Rating</div></div><?php endif; ?>
+    </div>
+    <?php if($stuRating&&!empty($stuRating['comment'])): ?>
+    <div style="padding:0 16px 16px">
+        <div style="background:var(--bg3);border-radius:8px;padding:10px 14px;font-size:12px;color:var(--muted);border-left:3px solid var(--amber)">
+            <i class="fa-solid fa-quote-left me-1" style="color:var(--amber)"></i><?= htmlspecialchars($stuRating['comment']) ?>
+        </div>
+    </div>
+    <?php endif; ?>
+</div>
+
+
+<!-- Student Certificates -->
+<?php
+$spTDCCerts=q($conn,"SELECT tc.*,i.fullname AS iname FROM tdc_certificates tc JOIN instructors i ON i.instructor_id=tc.issued_by WHERE tc.student_id=$viewStudentId ORDER BY tc.issued_at DESC");
+$spPDCCerts=q($conn,"SELECT pc.*,i.fullname AS iname FROM pdc_certificates pc JOIN instructors i ON i.instructor_id=pc.issued_by WHERE pc.student_id=$viewStudentId ORDER BY pc.issued_at DESC");
+if($spTDCCerts->num_rows>0||$spPDCCerts->num_rows>0):
+?>
+<div class="panel" style="margin-bottom:16px">
+    <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-certificate" style="color:var(--amber)"></i> Certificates Issued</div></div>
+    <?php if($spTDCCerts->num_rows>0): ?>
+    <div style="padding:8px 16px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--amber);border-bottom:1px solid var(--border);background:var(--bg3)">TDC Certificates</div>
+    <table class="tbl"><thead><tr><th>Cert Number</th><th>Issued By</th><th>Delivery</th><th>Date</th><th>Image</th></tr></thead><tbody>
+    <?php while($tc=$spTDCCerts->fetch_assoc()): ?>
+    <tr>
+        <td><?= $tc['cert_number']?htmlspecialchars($tc['cert_number']):'—' ?></td>
+        <td><?= htmlspecialchars($tc['iname']) ?></td>
+        <td><?= ($tc['delivery_method']??'face_to_face')==='online'?'<span class="bkb">Online</span>':'<span class="bkd">Face-to-Face</span>' ?></td>
+        <td><?= date('M d, Y',strtotime($tc['issued_at'])) ?></td>
+        <td><?php if(!empty($tc['cert_image'])&&file_exists('../assets/uploads/certs/'.$tc['cert_image'])): ?>
+            <a href="<?= 'view_image.php?type=certs&file='.urlencode($tc['cert_image']).'&back='.urlencode($_SERVER['REQUEST_URI']) ?>" class="bds" style="font-size:11px"><i class="fa-solid fa-eye me-1"></i>View</a>
+        <?php else: ?>—<?php endif; ?></td>
+    </tr>
+    <?php endwhile; ?></tbody></table>
+    <?php endif; ?>
+    <?php if($spPDCCerts->num_rows>0): ?>
+    <div style="padding:8px 16px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--green);border-bottom:1px solid var(--border);background:var(--bg3)">PDC Certificates</div>
+    <table class="tbl"><thead><tr><th>Cert Number</th><th>Issued By</th><th>Delivery</th><th>Date</th><th>Image</th></tr></thead><tbody>
+    <?php while($pc=$spPDCCerts->fetch_assoc()): ?>
+    <tr>
+        <td><?= $pc['cert_number']?htmlspecialchars($pc['cert_number']):'—' ?></td>
+        <td><?= htmlspecialchars($pc['iname']) ?></td>
+        <td><?= ($pc['delivery_method']??'face_to_face')==='online'?'<span class="bkb">Online</span>':'<span class="bkd">Face-to-Face</span>' ?></td>
+        <td><?= date('M d, Y',strtotime($pc['issued_at'])) ?></td>
+        <td><?php if(!empty($pc['cert_image'])&&file_exists('../assets/uploads/certs/'.$pc['cert_image'])): ?>
+            <a href="<?= 'view_image.php?type=certs&file='.urlencode($pc['cert_image']).'&back='.urlencode($_SERVER['REQUEST_URI']) ?>" class="bds" style="font-size:11px"><i class="fa-solid fa-eye me-1"></i>View</a>
+        <?php else: ?>—<?php endif; ?></td>
+    </tr>
+    <?php endwhile; ?></tbody></table>
+    <?php endif; ?>
+</div>
+<?php endif; ?>
+<div class="panel" style="margin-bottom:16px">
+    <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-calendar-check"></i> Appointments with You</div></div>
+    <table class="tbl"><thead><tr><th>Course</th><th>Start Date</th><th>Status</th><th>Sessions</th><th>Hours</th><th>Avg Grade</th><th>Certificate</th></tr></thead><tbody>
+    <?php if($stuAppts->num_rows===0): ?>
+    <tr><td colspan="7" style="text-align:center;color:var(--muted);padding:16px">No appointments found.</td></tr>
+    <?php else: while($sa=$stuAppts->fetch_assoc()): $tc=$cColors[$sa['course_type']]??'tag-gray'; ?>
+    <tr>
+        <td><span class="tag <?= $tc ?>"><?= htmlspecialchars($sa['course_type']) ?></span></td>
+        <td style="font-size:12px"><?= date('M d, Y',strtotime($sa['start_date'])) ?></td>
+        <td><span class="<?= $scmS[$sa['status']]??'bkd' ?>"><?= $scmL[$sa['status']]??'—' ?></span></td>
+        <td style="font-size:12px"><?= (int)$sa['sess_count'] ?> session<?= $sa['sess_count']!=1?'s':'' ?></td>
+        <td style="font-size:12px"><?= $sa['hours_done']??0 ?> hrs</td>
+        <td style="font-size:12px"><?php if($sa['avg_grade']): $gc2=$sa['avg_grade']>=80?'var(--green)':($sa['avg_grade']>=60?'var(--amber)':'var(--red)'); ?><strong style="color:<?= $gc2 ?>"><?= $sa['avg_grade'] ?>/100</strong><?php else: ?>—<?php endif; ?></td>
+        <td style="font-size:11px"><?= $sa['cert_number']?'<span class="bkg" style="font-size:10px"><i class="fa-solid fa-certificate me-1"></i>'.htmlspecialchars($sa['cert_number']).'</span>':'—' ?></td>
+    </tr>
+    <?php endwhile; endif; ?>
+    </tbody></table>
+</div>
+
+<div class="panel">
+    <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-list-check"></i> Session History</div></div>
+    <table class="tbl"><thead><tr><th>Date</th><th>Course</th><th>Session #</th><th>Hours</th><th>Grade</th><th>Rating</th><th>Notes</th></tr></thead><tbody>
+    <?php if($stuSess->num_rows===0): ?>
+    <tr><td colspan="7" style="text-align:center;color:var(--muted);padding:16px">No sessions recorded yet.</td></tr>
+    <?php else: while($ss=$stuSess->fetch_assoc()): $tc=$cColors[$ss['course_type']]??'tag-gray'; $ratingStars=''; for($i=1;$i<=5;$i++) $ratingStars.=$i<=($ss['performance_rating']??0)?'★':'☆'; ?>
+    <tr>
+        <td style="font-size:12px;white-space:nowrap"><?= date('M d, Y',strtotime($ss['session_date'])) ?></td>
+        <td><span class="tag <?= $tc ?>" style="font-size:10px"><?= htmlspecialchars($ss['course_type']) ?></span></td>
+        <td style="font-size:12px">Day <?= $ss['session_number'] ?></td>
+        <td style="font-size:12px"><?= $ss['hours_covered'] ?> hrs</td>
+        <td style="font-size:12px"><?php if($ss['grade']): $gc3=$ss['grade']>=80?'var(--green)':($ss['grade']>=60?'var(--amber)':'var(--red)'); ?><strong style="color:<?= $gc3 ?>"><?= $ss['grade'] ?>/100</strong><?php else: ?>—<?php endif; ?></td>
+        <td style="color:var(--amber);font-size:12px"><?= $ss['performance_rating']?$ratingStars:'—' ?></td>
+        <td style="font-size:11px;color:var(--muted);max-width:200px"><?= htmlspecialchars($ss['performance_notes']??'—') ?></td>
+    </tr>
+    <?php endwhile; endif; ?>
+    </tbody></table>
+</div>
+
+<?php else: ?>
+<div style="text-align:center;padding:60px;color:var(--muted)">
+    <i class="fa-solid fa-user-slash" style="font-size:36px;margin-bottom:12px;display:block;opacity:.3"></i>
+    <div>Student not found or not enrolled with you.</div>
+    <a href="<?= $selfFile ?>?section=students" class="be" style="margin-top:16px;display:inline-block">Back to My Students</a>
+</div>
+<?php endif; endif; ?>
 </div>
 
 <!-- ══ PERFORMANCE ════════════════════════════════════════════ -->
@@ -505,20 +494,10 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
 </div>
 <?php endif; ?>
 
-<!-- All sessions with ratings -->
 <div class="panel">
     <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-list-check"></i> All Session Records</div></div>
     <table class="tbl"><thead><tr><th>Date</th><th>Student</th><th>Course</th><th>Session #</th><th>Hours</th><th>Grade (TDC)</th><th>Rating</th><th>Improvements</th></tr></thead><tbody>
-    <?php
-    $allSess=q($conn,"
-        SELECT sess.*,ic.course_type,s.fullname AS sname
-        FROM sessions sess
-        JOIN appointments a ON a.appointment_id=sess.appointment_id
-        JOIN instructor_courses ic ON ic.course_id=a.course_id
-        JOIN students s ON s.student_id=sess.student_id
-        WHERE sess.instructor_id=$instructor_id
-        ORDER BY sess.session_date DESC
-    ");
+    <?php $allSess=q($conn,"SELECT sess.*,ic.course_type,s.fullname AS sname FROM sessions sess JOIN appointments a ON a.appointment_id=sess.appointment_id JOIN instructor_courses ic ON ic.course_id=a.course_id JOIN students s ON s.student_id=sess.student_id WHERE sess.instructor_id=$instructor_id ORDER BY sess.session_date DESC");
     if($allSess->num_rows===0): ?><tr><td colspan="8" style="color:var(--muted);text-align:center;padding:24px">No sessions yet.</td></tr>
     <?php else: while($ss=$allSess->fetch_assoc()): $tc=$cColors[$ss['course_type']]??'tag-gray'; $gc=$ss['grade']?($ss['grade']>=80?'var(--green)':($ss['grade']>=60?'var(--amber)':'var(--red)')):''; ?>
     <tr>
@@ -528,18 +507,13 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
         <td>Day <?= $ss['session_number']??'—' ?></td>
         <td><?= $ss['hours_covered'] ?> hrs</td>
         <td><?= $ss['grade']?'<strong style="color:'.$gc.'">'.$ss['grade'].'/100</strong>':'<span style="color:var(--muted)">—</span>' ?></td>
-        <td>
-            <?php if($ss['performance_rating']): ?>
-            <span style="color:var(--amber)"><?= str_repeat('★',$ss['performance_rating']).str_repeat('☆',5-$ss['performance_rating']) ?></span>
-            <?php else: ?><span class="bkp">Not rated</span><?php endif; ?>
-        </td>
+        <td><?php if($ss['performance_rating']): ?><span style="color:var(--amber)"><?= str_repeat('★',$ss['performance_rating']).str_repeat('☆',5-$ss['performance_rating']) ?></span><?php else: ?><span class="bkp">Not rated</span><?php endif; ?></td>
         <td style="font-size:11px;color:var(--muted);max-width:150px"><?= $ss['improvements']?htmlspecialchars(substr($ss['improvements'],0,60)).'…':'—' ?></td>
     </tr>
     <?php endwhile; endif; ?>
     </tbody></table>
 </div>
 
-<!-- Completed TDC appointments awaiting certificate -->
 <div class="panel">
     <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-certificate" style="color:var(--amber)"></i> TDC Complete – Issue Certificates</div></div>
     <?php $certPending=q($conn,"SELECT a.*,s.fullname AS sname,a.tdc_overall_grade FROM appointments a JOIN students s ON s.student_id=a.student_id JOIN instructor_courses ic ON ic.course_id=a.course_id WHERE a.instructor_id=$instructor_id AND a.status='completed' AND ic.course_type LIKE 'TDC%' AND NOT EXISTS(SELECT 1 FROM tdc_certificates WHERE appointment_id=a.appointment_id)");
@@ -558,7 +532,6 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
     <?php endwhile; endif; ?>
 </div>
 
-<!-- Instructor ratings received -->
 <div class="panel">
     <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-medal"></i> Student Reviews of You</div></div>
     <?php $myRatings=q($conn,"SELECT ir.*,s.fullname AS sname,ic.course_type FROM instructor_ratings ir JOIN students s ON s.student_id=ir.student_id JOIN appointments a ON a.appointment_id=ir.appointment_id JOIN instructor_courses ic ON ic.course_id=a.course_id WHERE ir.instructor_id=$instructor_id ORDER BY ir.rated_at DESC");
@@ -579,20 +552,21 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
 
 <!-- ══ MY COURSES ═════════════════════════════════════════════ -->
 <div id="section-courses" class="section <?= $activeSection==='courses'?'active':'' ?>">
+<?php $editCourseId=(int)($_GET['edit_course']??0); ?>
 <div class="panel mb-3">
     <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-plus"></i> Add New Course</div></div>
     <div style="padding:16px">
-    <form method="POST" style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:10px;align-items:end">
+    <form method="POST" style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr auto;gap:10px;align-items:end">
         <input type="hidden" name="action" value="add_course">
         <div><label class="form-label">Course Type</label>
             <select name="course_type" class="di" required>
                 <option value="">— Select —</option>
-                <?php foreach($courseTypeOpts as $opt): ?>
-                <option value="<?= $opt ?>"><?= $opt ?></option>
-                <?php endforeach; ?>
+                <?php foreach($courseTypeOpts as $opt): ?><option value="<?= $opt ?>"><?= $opt ?></option><?php endforeach; ?>
             </select></div>
         <div><label class="form-label">Price per Hour (₱)</label>
             <input type="number" name="price_per_hr" class="di" min="0" step="0.01" required placeholder="e.g. 134.00"></div>
+        <div><label class="form-label">Student Limit per Date</label>
+            <input type="number" name="student_limit" class="di" min="1" max="50" placeholder="Leave blank = unlimited"></div>
         <div><label class="form-label">Description (optional)</label>
             <input type="text" name="description" class="di" placeholder="Short description"></div>
         <button type="submit" class="be" style="height:36px"><i class="fa-solid fa-plus"></i> Add</button>
@@ -601,17 +575,19 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
 </div>
 <div class="panel">
     <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-book-open"></i> My Courses</div></div>
-    <table class="tbl"><thead><tr><th>Course Type</th><th>Price/Hr</th><th>TDC Hrs</th><th>Description</th><th>Status</th><th></th></tr></thead><tbody>
+    <table class="tbl"><thead><tr><th>Course Type</th><th>Price/Hr</th><th>TDC Hrs</th><th>Student Limit</th><th>Description</th><th>Status</th><th></th></tr></thead><tbody>
     <?php $myCourses->data_seek(0); if($myCourses->num_rows===0): ?>
-    <tr><td colspan="6" style="color:var(--muted);text-align:center;padding:24px">No courses yet. Add one above.</td></tr>
+    <tr><td colspan="7" style="color:var(--muted);text-align:center;padding:24px">No courses yet. Add one above.</td></tr>
     <?php else: while($c=$myCourses->fetch_assoc()): $tc=$cColors[$c['course_type']]??'tag-gray'; $isTDC=stripos($c['course_type'],'TDC')===0; ?>
     <tr>
         <td><span class="tag <?= $tc ?>"><?= htmlspecialchars($c['course_type']) ?></span></td>
         <td>₱<?= number_format($c['price_per_hr'],2) ?></td>
-        <td><?= $isTDC ? '<strong>15 hrs fixed</strong>' : 'Flexible' ?></td>
+        <td><?= $isTDC?'<strong>15 hrs fixed</strong>':'Flexible' ?></td>
+        <td><?php if(!empty($c['student_limit'])): ?><span style="background:rgba(124,106,247,.15);color:var(--accent);padding:2px 10px;border-radius:20px;font-size:11px"><i class="fa-solid fa-users me-1"></i><?= $c['student_limit'] ?>/date</span><?php else: ?><span style="color:var(--muted);font-size:11px">Unlimited</span><?php endif; ?></td>
         <td style="font-size:11px;color:var(--muted)"><?= $c['description']?htmlspecialchars($c['description']):'—' ?></td>
-        <td><?= $c['is_active'] ? '<span class="bkg">Active</span>' : '<span class="bkd">Inactive</span>' ?></td>
-        <td style="display:flex;gap:4px">
+        <td><?= $c['is_active']?'<span class="bkg">Active</span>':'<span class="bkd">Inactive</span>' ?></td>
+        <td style="display:flex;gap:4px;flex-wrap:wrap">
+            <button class="bds" style="font-size:11px" onclick="openEditCourse(<?= $c['course_id'] ?>,'<?= addslashes(htmlspecialchars($c['description'])) ?>',<?= $c['price_per_hr'] ?>,'<?= $c['student_limit']??'' ?>')"><i class="fa-solid fa-pen"></i> Edit</button>
             <form method="POST"><input type="hidden" name="action" value="toggle_course"><input type="hidden" name="course_id" value="<?= $c['course_id'] ?>">
             <button type="submit" class="bds" style="font-size:11px"><?= $c['is_active']?'Deactivate':'Activate' ?></button></form>
             <form method="POST" onsubmit="return confirm('Delete this course?')"><input type="hidden" name="action" value="delete_course"><input type="hidden" name="course_id" value="<?= $c['course_id'] ?>">
@@ -621,7 +597,66 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
     <?php endwhile; endif; ?>
     </tbody></table>
 </div>
+
+<!-- Upcoming Schedule Slots -->
+<?php
+$scheduleSlots=q($conn,"SELECT cs.*,ic.course_type FROM course_schedules cs JOIN instructor_courses ic ON ic.course_id=cs.course_id WHERE cs.instructor_id=$instructor_id AND cs.schedule_date>=CURDATE() ORDER BY cs.schedule_date ASC LIMIT 20");
+if($scheduleSlots->num_rows>0):
+?>
+<div class="panel">
+    <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-calendar-days"></i> Upcoming Schedule Slots</div>
+        <small style="color:var(--muted);font-size:10px">Dates with student bookings</small></div>
+    <table class="tbl"><thead><tr><th>Date</th><th>Course</th><th>Booked</th><th>Limit</th><th>Slots Left</th></tr></thead><tbody>
+    <?php while($sl=$scheduleSlots->fetch_assoc()):
+        $limit=$sl['student_limit']??0;
+        $booked=(int)$sl['booked_count'];
+        $left=$limit>0?max(0,$limit-$booked):null;
+        $pct=$limit>0?round($booked/$limit*100):0;
+        $barColor=$pct>=100?'var(--red)':($pct>=75?'var(--amber)':'var(--green)');
+        $tc=$cColors[$sl['course_type']]??'tag-gray';
+    ?>
+    <tr>
+        <td><strong><?= date('M d, Y (D)',strtotime($sl['schedule_date'])) ?></strong></td>
+        <td><span class="tag <?= $tc ?>"><?= htmlspecialchars($sl['course_type']) ?></span></td>
+        <td>
+            <div style="display:flex;align-items:center;gap:8px">
+                <span style="font-weight:600"><?= $booked ?></span>
+                <?php if($limit>0): ?>
+                <div style="width:60px;height:6px;background:var(--border);border-radius:3px;overflow:hidden"><div style="height:100%;width:<?= $pct ?>%;background:<?= $barColor ?>;border-radius:3px"></div></div>
+                <?php endif; ?>
+            </div>
+        </td>
+        <td><?= $limit>0?$limit:'<span style="color:var(--muted)">Unlimited</span>' ?></td>
+        <td><?php if($left===null): ?><span style="color:var(--muted)">∞</span>
+            <?php elseif($left===0): ?><span class="bkr">FULL</span>
+            <?php else: ?><span style="color:var(--green);font-weight:600"><?= $left ?> open</span>
+            <?php endif; ?></td>
+    </tr>
+    <?php endwhile; ?></tbody></table>
 </div>
+<?php endif; ?>
+</div>
+
+<!-- ══ EDIT COURSE MODAL ═══════════════════════════════════════ -->
+<div id="editCourseModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;align-items:center;justify-content:center">
+<div style="background:var(--bg2);border:1px solid var(--border);border-radius:12px;width:440px;max-width:95vw;padding:24px">
+    <div style="font-size:15px;font-weight:600;margin-bottom:16px"><i class="fa-solid fa-pen me-2" style="color:var(--accent)"></i>Edit Course</div>
+    <form method="POST">
+    <input type="hidden" name="action" value="update_course">
+    <input type="hidden" name="course_id" id="ec_course_id">
+    <div style="margin-bottom:12px"><label class="form-label">Price per Hour (₱) *</label>
+        <input type="number" name="price_per_hr" id="ec_price" class="di" min="0" step="0.01" required></div>
+    <div style="margin-bottom:12px"><label class="form-label">Student Limit per Date</label>
+        <input type="number" name="student_limit" id="ec_limit" class="di" min="1" max="50" placeholder="Leave blank = unlimited">
+        <div style="font-size:10px;color:var(--muted);margin-top:3px">Maximum students that can book this course on the same start date.</div></div>
+    <div style="margin-bottom:16px"><label class="form-label">Description (optional)</label>
+        <input type="text" name="description" id="ec_desc" class="di" placeholder="Short description"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button type="button" class="bds" onclick="closeEditCourse()">Cancel</button>
+        <button type="submit" class="be"><i class="fa-solid fa-save me-1"></i>Save Changes</button>
+    </div>
+    </form>
+</div></div>
 
 <!-- ══ NOTIFICATIONS ══════════════════════════════════════════ -->
 <div id="section-messages" class="section <?= $activeSection==='messages'?'active':'' ?>">
@@ -643,6 +678,73 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
 </div>
 </div>
 
+<!-- ══ CHAT / MESSAGING ════════════════════════════════════════ -->
+<div id="section-chat" class="section <?= in_array($activeSection,['chat'])?'active':'' ?>">
+<?php
+$studentMap=[];
+$myStudents->data_seek(0);
+while($ms=$myStudents->fetch_assoc()){
+    $sid=(int)$ms['student_id'];
+    if(!isset($studentMap[$sid])) $studentMap[$sid]=$ms;
+}
+?>
+<div style="display:flex;gap:16px;height:calc(100vh - 160px);min-height:400px">
+<div style="width:240px;flex-shrink:0;background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow-y:auto">
+    <div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.06em">My Students</div>
+    <?php if(empty($studentMap)): ?>
+    <div style="padding:20px;text-align:center;color:var(--muted);font-size:12px">No enrolled students yet.</div>
+    <?php else: foreach($studentMap as $sid=>$ms):
+        $unread=$unreadMsgMap[$sid]??0;
+        $isActive=($chatStudentId===$sid);
+    ?>
+    <a href="<?= $selfFile ?>?section=chat&chat_student=<?= $sid ?>"
+       style="display:flex;align-items:center;gap:10px;padding:10px 14px;text-decoration:none;border-bottom:1px solid var(--border);background:<?= $isActive?'rgba(124,106,247,.12)':'transparent' ?>;transition:.15s"
+       onmouseover="this.style.background='rgba(124,106,247,.08)'" onmouseout="this.style.background='<?= $isActive?'rgba(124,106,247,.12)':'transparent' ?>'">
+        <div style="width:34px;height:34px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff;flex-shrink:0"><?= strtoupper(substr($ms['fullname'],0,1)) ?></div>
+        <div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><?= htmlspecialchars($ms['fullname']) ?></div></div>
+        <?php if($unread>0): ?><span class="tag tag-blue" style="font-size:10px;padding:1px 6px"><?= $unread ?></span><?php endif; ?>
+    </a>
+    <?php endforeach; endif; ?>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden">
+<?php if($chatStudentId>0&&isset($studentMap[$chatStudentId])):
+    $cStudent=$studentMap[$chatStudentId];
+    $conn->query("UPDATE messages SET is_read=1 WHERE receiver_id=$instructor_id AND receiver_type='instructor' AND sender_id=$chatStudentId AND sender_type='student'");
+    $convRes=q($conn,"SELECT * FROM messages WHERE (sender_id=$instructor_id AND sender_type='instructor' AND receiver_id=$chatStudentId AND receiver_type='student') OR (sender_id=$chatStudentId AND sender_type='student' AND receiver_id=$instructor_id AND receiver_type='instructor') ORDER BY created_at ASC");
+?>
+<div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">
+    <div style="width:32px;height:32px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff"><?= strtoupper(substr($cStudent['fullname'],0,1)) ?></div>
+    <div><div style="font-size:13px;font-weight:600"><?= htmlspecialchars($cStudent['fullname']) ?></div></div>
+</div>
+<div style="flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px" id="msg-thread">
+    <?php if($convRes->num_rows===0): ?>
+    <div style="text-align:center;color:var(--muted);font-size:12px;margin:auto">No messages yet. Say hello!</div>
+    <?php else: while($cv=$convRes->fetch_assoc()): $isMine=$cv['sender_type']==='instructor'; ?>
+    <div style="display:flex;justify-content:<?= $isMine?'flex-end':'flex-start' ?>">
+        <div style="max-width:72%;background:<?= $isMine?'var(--accent)':'var(--bg3)' ?>;color:<?= $isMine?'#fff':'var(--text)' ?>;padding:8px 12px;border-radius:<?= $isMine?'14px 14px 4px 14px':'14px 14px 14px 4px' ?>;font-size:12px;line-height:1.5">
+            <?= nl2br(htmlspecialchars($cv['body'])) ?>
+            <div style="font-size:9px;opacity:.65;margin-top:4px;text-align:right"><?= date('M d, g:i A',strtotime($cv['created_at'])) ?></div>
+        </div>
+    </div>
+    <?php endwhile; endif; ?>
+</div>
+<form method="POST" style="padding:12px 16px;border-top:1px solid var(--border);display:flex;gap:8px">
+    <input type="hidden" name="action" value="send_message">
+    <input type="hidden" name="to_student_id" value="<?= $chatStudentId ?>">
+    <input type="hidden" name="appointment_id" value="<?= $cStudent['appointment_id']??0 ?>">
+    <textarea name="body" class="di" rows="1" placeholder="Type a message…" required style="flex:1;resize:none;height:38px;padding:8px 12px" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();this.form.submit();}"></textarea>
+    <button type="submit" class="be" style="height:38px;padding:0 16px"><i class="fa-solid fa-paper-plane"></i></button>
+</form>
+<?php else: ?>
+<div style="flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;color:var(--muted)">
+    <i class="fa-solid fa-comments" style="font-size:36px;opacity:.3"></i>
+    <div style="font-size:13px">Select a student to start a conversation</div>
+</div>
+<?php endif; ?>
+</div>
+</div>
+</div>
+
 <!-- ══ PROFILE ════════════════════════════════════════════════ -->
 <div id="section-profile" class="section <?= $activeSection==='profile'?'active':'' ?>">
 <?php $certOk=!empty($instructor['certificate_image'])&&file_exists($uploadDir.$instructor['certificate_image']); ?>
@@ -658,34 +760,20 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
         </div>
     </div>
 </div>
-
 <div class="panel">
     <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-pen"></i> Edit Profile</div></div>
     <div style="padding:20px">
     <form method="POST" enctype="multipart/form-data">
         <input type="hidden" name="action" value="update_profile">
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-            <div>
-                <label class="form-label">Full Name *</label>
-                <input type="text" name="fullname" class="di" value="<?= htmlspecialchars($instructor['fullname']) ?>" required>
-            </div>
-            <div>
-                <label class="form-label">Email *</label>
-                <input type="email" name="email" class="di" value="<?= htmlspecialchars($instructor['email']) ?>" required>
-            </div>
-            <div>
-                <label class="form-label">Mobile Number</label>
-                <input type="text" name="mobile" class="di" value="<?= htmlspecialchars($instructor['mobile']??'') ?>" placeholder="+63 9XX XXX XXXX">
-            </div>
-            <div>
-                <label class="form-label">Upload New Certificate (Image/PDF)</label>
+            <div><label class="form-label">Full Name *</label><input type="text" name="fullname" class="di" value="<?= htmlspecialchars($instructor['fullname']) ?>" required></div>
+            <div><label class="form-label">Email *</label><input type="email" name="email" class="di" value="<?= htmlspecialchars($instructor['email']) ?>" required></div>
+            <div><label class="form-label">Mobile Number</label><input type="text" name="mobile" class="di" value="<?= htmlspecialchars($instructor['mobile']??'') ?>" placeholder="+63 9XX XXX XXXX"></div>
+            <div><label class="form-label">Upload New Certificate (Image/PDF)</label>
                 <input type="file" name="certificate_image" class="di" accept="image/*,.pdf">
-                <?php if($certOk): ?><div style="font-size:10px;color:var(--green);margin-top:4px"><i class="fa-solid fa-check me-1"></i>Certificate uploaded. Upload new to replace.</div><?php endif; ?>
-            </div>
-            <div style="grid-column:1/-1">
-                <label class="form-label">Bio / Short Description</label>
-                <textarea name="bio" class="di" rows="3" placeholder="Describe your experience, specializations, teaching style…"><?= htmlspecialchars($instructor['bio']??'') ?></textarea>
-            </div>
+                <?php if($certOk): ?><div style="font-size:10px;color:var(--green);margin-top:4px"><i class="fa-solid fa-check me-1"></i>Certificate uploaded. Upload new to replace.</div><?php endif; ?></div>
+            <div style="grid-column:1/-1"><label class="form-label">Bio / Short Description</label>
+                <textarea name="bio" class="di" rows="3" placeholder="Describe your experience, specializations, teaching style…"><?= htmlspecialchars($instructor['bio']??'') ?></textarea></div>
         </div>
         <div style="margin-top:16px;display:flex;align-items:center;gap:12px">
             <button type="submit" class="be"><i class="fa-solid fa-save"></i> Save Profile</button>
@@ -694,12 +782,14 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
     </form>
     </div>
 </div>
-
 <?php if($certOk): ?>
 <div class="panel">
     <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-id-card"></i> Current Certificate</div></div>
     <div style="padding:16px">
-        <img src="<?= htmlspecialchars('../assets/uploads/certificates/'.$instructor['certificate_image']) ?>" style="max-height:200px;border-radius:8px;cursor:pointer;border:1px solid var(--border)" onclick="window.open(this.src)">
+        <img src="<?= htmlspecialchars('../assets/uploads/certificates/'.$instructor['certificate_image']) ?>" style="max-height:200px;border-radius:8px;border:1px solid var(--border);display:block">
+        <div style="display:flex;gap:6px;margin-top:8px">
+            <a href="<?= 'view_image.php?type=certificates&file='.urlencode($instructor['certificate_image']).'&back='.urlencode($_SERVER['REQUEST_URI']) ?>" class="bds" style="font-size:11px"><i class="fa-solid fa-eye me-1"></i>View</a>
+        </div>
         <div style="font-size:11px;color:var(--muted);margin-top:8px">Click to view full size</div>
     </div>
 </div>
@@ -737,7 +827,6 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
     <input type="hidden" name="appointment_id" id="sm_appt_id">
     <div style="margin-bottom:12px">
         <label class="form-label">Session Date</label>
-        <!-- TDC: only Saturday & Sunday allowed -->
         <input type="date" name="session_date" id="sm_date" class="di" value="<?= $today ?>" required>
         <div id="sm_day_hint" style="font-size:10px;color:var(--amber);margin-top:3px;display:none"><i class="fa-solid fa-info-circle"></i> TDC sessions are only available on Saturdays and Sundays.</div>
     </div>
@@ -745,7 +834,6 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
         <label class="form-label">Hours Covered</label>
         <input type="number" name="hours_covered" class="di" min="0.5" max="8" step="0.5" value="3" required>
     </div>
-    <!-- TDC Grade fields -->
     <div id="sm_tdc_fields">
         <div style="margin-bottom:12px">
             <label class="form-label">Session Grade (1–100) <span style="color:var(--accent)">TDC only</span></label>
@@ -841,9 +929,10 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
     </form>
 </div></div>
 
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script>
-const T={dashboard:'Dashboard',appointments:'Appointments',students:'My Students',
-  performance:'Performance',courses:'My Courses',messages:'Notifications',profile:'Profile'};
+const T={dashboard:'Dashboard',appointments:'Appointments',students:'My Students',student_profile:'Student Profile',
+  performance:'Performance',courses:'My Courses',messages:'Notifications',chat:'Messages',profile:'Profile'};
 
 function showSection(n){
     document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));
@@ -857,7 +946,34 @@ function showSection(n){
     const u=new URL(window.location.href);
     u.searchParams.set('section',n);
     window.history.pushState({},'',u);
+    if(n==='dashboard') setTimeout(initInstrCharts,80);
 }
+
+var instrChartsOk=false;
+function initInstrCharts(){
+    if(instrChartsOk||typeof Chart==='undefined') return;
+    instrChartsOk=true;
+    var cs=getComputedStyle(document.documentElement);
+    var accent=cs.getPropertyValue('--accent').trim()||'#7c6af7';
+    var green=cs.getPropertyValue('--green').trim()||'#3cb97a';
+    var amber=cs.getPropertyValue('--amber').trim()||'#f59e0b';
+    var red=cs.getPropertyValue('--red').trim()||'#e55555';
+    var muted=cs.getPropertyValue('--muted').trim()||'#8490a8';
+    var border=cs.getPropertyValue('--border').trim()||'#2a3147';
+    var bg=cs.getPropertyValue('--bg').trim()||'#0f1117';
+    Chart.defaults.color=muted;Chart.defaults.font.family='Segoe UI,sans-serif';Chart.defaults.font.size=11;
+
+    var c1=document.getElementById('instrChartHours');
+    if(c1){new Chart(c1,{type:'line',data:{labels:<?= json_encode($instrMonths) ?>,datasets:[{label:'Hours Taught',data:<?= json_encode($instrSessPerMonth) ?>,borderColor:accent,backgroundColor:accent+'33',fill:true,tension:0.4,pointBackgroundColor:accent,pointRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:border+'44'}},y:{grid:{color:border+'44'},beginAtZero:true}}}});}
+
+    var c2=document.getElementById('instrChartSplit');
+    if(c2){new Chart(c2,{type:'doughnut',data:{labels:['TDC','PDC'],datasets:[{data:[<?= $instrTDCSess ?>,<?= $instrPDCSess ?>],backgroundColor:[amber+'cc',green+'cc'],borderColor:bg,borderWidth:3,hoverOffset:6}]},options:{responsive:true,maintainAspectRatio:false,cutout:'60%',plugins:{legend:{display:false}}}});}
+
+    var c3=document.getElementById('instrChartGrades');
+    if(c3){new Chart(c3,{type:'bar',data:{labels:['90–100','80–89','70–79','60–69','< 60'],datasets:[{label:'Students',data:[<?= implode(',',$instrGradeBuckets) ?>],backgroundColor:[green+'cc',accent+'cc',amber+'cc','#fb923c99',red+'99'],borderRadius:4}]},options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:border+'44'},beginAtZero:true,ticks:{precision:0,stepSize:1}},y:{grid:{color:border+'22'}}}}});}
+}
+
+(function(){ if(document.querySelector('#section-dashboard.active')) setTimeout(initInstrCharts,120); })();
 
 let _sessionIsTDC=false;
 function openApproveModal(id,sname,approve){
@@ -877,7 +993,6 @@ function openSessionModal(apptId,studentId,sname,type){
     document.getElementById('sm_sname').textContent='Student: '+sname+' | '+type+' Session';
     document.getElementById('sm_tdc_fields').style.display=_sessionIsTDC?'block':'none';
     document.getElementById('sm_day_hint').style.display=_sessionIsTDC?'block':'none';
-    // Enforce Sat/Sun only for TDC
     const dateInput=document.getElementById('sm_date');
     dateInput.removeEventListener('change',validateTDCDay);
     if(_sessionIsTDC)dateInput.addEventListener('change',validateTDCDay);
@@ -886,10 +1001,7 @@ function openSessionModal(apptId,studentId,sname,type){
 function validateTDCDay(){
     const d=new Date(this.value+'T00:00:00');
     const day=d.getDay();
-    if(day!==0&&day!==6){
-        alert('TDC sessions must be on Saturday or Sunday only.');
-        this.value='';
-    }
+    if(day!==0&&day!==6){alert('TDC sessions must be on Saturday or Sunday only.');this.value='';}
 }
 function closeSessionModal(){document.getElementById('sessionModal').style.display='none';}
 
@@ -918,9 +1030,16 @@ function toggleCertUpload(show){
     document.getElementById('cert_image_input').required=show;
 }
 
-['approveModal','sessionModal','perfModal','certModal'].forEach(id=>{
-    document.getElementById(id).addEventListener('click',function(e){if(e.target===this)this.style.display='none';});
-});
+function openEditCourse(id,desc,price,limit){
+    document.getElementById('ec_course_id').value=id;
+    document.getElementById('ec_desc').value=desc;
+    document.getElementById('ec_price').value=price;
+    document.getElementById('ec_limit').value=limit||'';
+    document.getElementById('editCourseModal').style.display='flex';
+}
+function closeEditCourse(){document.getElementById('editCourseModal').style.display='none';}
+document.getElementById('editCourseModal').addEventListener('click',function(e){if(e.target===this)closeEditCourse();});
+(function(){var t=document.getElementById('msg-thread');if(t) t.scrollTop=t.scrollHeight;})();
 </script>
 </body>
 </html>

@@ -37,6 +37,7 @@ $activeInstructor = q($conn,"
 // ── active section ────────────────────────────────────────────
 $activeSection = 'dashboard';
 if (!empty($_GET['section'])) $activeSection = preg_replace('/[^a-z_]/','',$_GET['section']);
+if(!empty($_GET['chat_instr'])&&$activeSection==='dashboard')$activeSection='chat';
 $viewInstrId = (int)($_GET['view_instr'] ?? 0);
 
 // ── POST handlers ─────────────────────────────────────────────
@@ -112,13 +113,44 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
         header("Location: $selfFile?section=messages"); exit;
     }
 
+    // Send message to enrolled instructor
+    if($action==='send_message_student'){
+        $to_id=(int)($_POST['to_instructor_id']??0);
+        $body=esc($conn,trim($_POST['body']??''));
+        $appt_id=(int)($_POST['appointment_id']??0);
+        // Verify student is enrolled with this instructor
+        $ok=q($conn,"SELECT COUNT(*) AS c FROM appointments WHERE student_id=$student_id AND instructor_id=$to_id AND status IN('pending','approved','in_progress','completed')")->fetch_assoc()['c'];
+        if($ok>0&&$body!==''){
+            $appt_col=$appt_id>0?"$appt_id":"NULL";
+            $conn->query("INSERT INTO messages (sender_id,sender_type,receiver_id,receiver_type,appointment_id,body) VALUES ($student_id,'student',$to_id,'instructor',$appt_col,'$body')");
+            $conn->query("INSERT INTO notifications (user_id,user_type,message,type) VALUES ($to_id,'instructor','💬 Message from your student.','message')");
+        }
+        header("Location: $selfFile?section=chat&chat_instr=$to_id"); exit;
+    }
+
     // Update student profile
     if($action==='update_profile'){
         $name=esc($conn,$_POST['fullname']??'');
         $email=esc($conn,$_POST['email']??'');
         $mobile=esc($conn,$_POST['mobile']??'');
         $address=esc($conn,$_POST['address']??'');
-        $conn->query("UPDATE students SET fullname='$name',email='$email',mobile='$mobile',address='$address' WHERE student_id=$student_id");
+        $gender=in_array($_POST['gender']??'',['Male','Female','Other'])?$_POST['gender']:'';
+        $fb_link=esc($conn,$_POST['fb_link']??'');
+
+        // Handle ID photo upload
+        $idPhotoSQL='';
+        if(isset($_FILES['id_photo'])&&$_FILES['id_photo']['error']===0){
+            $ext=strtolower(pathinfo($_FILES['id_photo']['name'],PATHINFO_EXTENSION));
+            if(in_array($ext,['jpg','jpeg','png','gif','webp'])){
+                $uploadPath='../assets/uploads/student_ids/';
+                if(!is_dir($uploadPath))mkdir($uploadPath,0755,true);
+                $fname='sid_'.$student_id.'_'.time().'.'.$ext;
+                if(move_uploaded_file($_FILES['id_photo']['tmp_name'],$uploadPath.$fname)){
+                    $idPhotoSQL=",id_photo='$fname'";
+                }
+            }
+        }
+        $conn->query("UPDATE students SET fullname='$name',email='$email',mobile='$mobile',address='$address',gender='$gender',fb_link='$fb_link'$idPhotoSQL WHERE student_id=$student_id");
         $_SESSION['student_name']=$_POST['fullname']??'';
         $_SESSION['flash']='Profile updated.';
         header("Location: $selfFile?section=profile"); exit;
@@ -128,6 +160,14 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 // ── data loads ────────────────────────────────────────────────
 $student = q($conn,"SELECT * FROM students WHERE student_id=$student_id")->fetch_assoc();
 $unreadCnt = (int)q($conn,"SELECT COUNT(*) AS c FROM notifications WHERE user_id=$student_id AND user_type='student' AND is_read=0")->fetch_assoc()['c'];
+// Instructors for messaging (any appointment with this student)
+$myInstructors=q($conn,"SELECT DISTINCT i.instructor_id,i.fullname,i.email,a.appointment_id,ic.course_type,a.status FROM appointments a JOIN instructors i ON i.instructor_id=a.instructor_id JOIN instructor_courses ic ON ic.course_id=a.course_id WHERE a.student_id=$student_id ORDER BY i.fullname");
+// Unread message count per instructor
+$unreadMsgMapS=[];
+$umResS=q($conn,"SELECT sender_id,COUNT(*) AS cnt FROM messages WHERE receiver_id=$student_id AND receiver_type='student' AND is_read=0 AND sender_type='instructor' GROUP BY sender_id");
+while($ums=$umResS->fetch_assoc()) $unreadMsgMapS[(int)$ums['sender_id']]=(int)$ums['cnt'];
+$totalUnreadMsgS=array_sum($unreadMsgMapS);
+$chatInstrId=(int)($_GET['chat_instr']??0);
 
 $myAppts = q($conn,"
     SELECT a.*,ic.course_type,ic.price_per_hr,i.fullname AS instr_name,
@@ -186,6 +226,29 @@ $flash = $_SESSION['flash'] ?? null; unset($_SESSION['flash']);
 $flashErr = $_SESSION['flash_err'] ?? null; unset($_SESSION['flash_err']);
 $scmS=['pending'=>'bkp','approved'=>'bksu','in_progress'=>'bkb','completed'=>'bkg','rejected'=>'bkr','cancelled'=>'bkd'];
 $scmL=['pending'=>'Pending','approved'=>'Approved','in_progress'=>'In Progress','completed'=>'Completed','rejected'=>'Rejected','cancelled'=>'Cancelled'];
+
+// ── Chart data (computed here so variables are available everywhere) ──
+$sbTotalHrsPre=(float)q($conn,"SELECT COALESCE(SUM(hours_covered),0) AS h FROM sessions WHERE student_id=$student_id AND status='completed'")->fetch_assoc()['h'];
+$sbTDCHrsPre=(float)q($conn,"SELECT COALESCE(SUM(s.hours_covered),0) AS h FROM sessions s JOIN appointments a ON a.appointment_id=s.appointment_id JOIN instructor_courses ic ON ic.course_id=a.course_id WHERE s.student_id=$student_id AND s.status='completed' AND ic.course_type LIKE 'TDC%'")->fetch_assoc()['h'];
+$sbPDCHrsPre=max(0,$sbTotalHrsPre-$sbTDCHrsPre);
+$sbTDCProgressPre=min(100,round($sbTDCHrsPre/15*100));
+$sbSessionsPre=(int)q($conn,"SELECT COUNT(*) AS c FROM sessions WHERE student_id=$student_id AND status='completed'")->fetch_assoc()['c'];
+
+// 1) TDC vs PDC hours per month (6 months)
+$stuMonths=[]; $stuTDCHrsMonth=[]; $stuPDCHrsMonth=[];
+for($m=5;$m>=0;$m--){
+    $stuMonths[]=date('M Y',strtotime("-$m months"));
+    $ym=date('Y-m',strtotime("-$m months"));
+    $stuTDCHrsMonth[]=(float)q($conn,"SELECT COALESCE(SUM(s.hours_covered),0) AS h FROM sessions s JOIN appointments a ON a.appointment_id=s.appointment_id JOIN instructor_courses ic ON ic.course_id=a.course_id WHERE s.student_id=$student_id AND s.status='completed' AND ic.course_type LIKE 'TDC%' AND DATE_FORMAT(s.session_date,'%Y-%m')='$ym'")->fetch_assoc()['h'];
+    $stuPDCHrsMonth[]=(float)q($conn,"SELECT COALESCE(SUM(s.hours_covered),0) AS h FROM sessions s JOIN appointments a ON a.appointment_id=s.appointment_id JOIN instructor_courses ic ON ic.course_id=a.course_id WHERE s.student_id=$student_id AND s.status='completed' AND ic.course_type LIKE 'PDC%' AND DATE_FORMAT(s.session_date,'%Y-%m')='$ym'")->fetch_assoc()['h'];
+}
+// 2) Grade trend (last 10 graded sessions)
+$stuGradeTrend=[]; $stuGradeLabels=[];
+$grRes=q($conn,"SELECT grade,session_date,session_number FROM sessions WHERE student_id=$student_id AND grade IS NOT NULL AND status='completed' ORDER BY session_date ASC,session_id ASC LIMIT 10");
+while($gr=$grRes->fetch_assoc()){
+    $stuGradeLabels[]='Day '.$gr['session_number'].' '.date('M d',strtotime($gr['session_date']));
+    $stuGradeTrend[]=(int)$gr['grade'];
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -199,13 +262,13 @@ $scmL=['pending'=>'Pending','approved'=>'Approved','in_progress'=>'In Progress',
 :root{--bg:#0f1117;--bg2:#181c27;--bg3:#1e2436;--border:#2a3147;--accent:#7c6af7;--green:#3cb97a;--amber:#f59e0b;--red:#e55;--text:#e2e5f0;--muted:#8490a8}
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;min-height:100vh;display:flex}
-.sidebar{width:220px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:20px 0;flex-shrink:0;position:fixed;height:100vh;overflow-y:auto;z-index:100}
+.sidebar{width:240px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:20px 0;flex-shrink:0;position:fixed;height:100vh;overflow-y:auto;z-index:100}
 .brand{padding:0 18px 20px;font-size:15px;font-weight:700;color:var(--accent);border-bottom:1px solid var(--border);margin-bottom:12px}
 .nav-item{display:flex;align-items:center;gap:10px;padding:10px 18px;color:var(--muted);font-size:13px;cursor:pointer;border-radius:0;transition:.15s;text-decoration:none;border:none;background:none;width:100%;text-align:left}
 .nav-item:hover,.nav-item.active{background:rgba(124,106,247,.12);color:var(--text)}
 .nav-item.active{border-left:3px solid var(--accent);color:var(--accent)}
 .nav-item i{width:16px;text-align:center}
-.main{margin-left:220px;flex:1;padding:24px;min-height:100vh}
+.main{margin-left:240px;flex:1;padding:24px;min-height:100vh}
 .page-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
 .page-title{font-size:18px;font-weight:600}
 .section{display:none}.section.active{display:block}
@@ -255,6 +318,16 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
 .grade-bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden;margin-top:3px}
 .grade-fill{height:100%;border-radius:3px}
 .course-section-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);padding:8px 12px;border-bottom:1px solid var(--border);background:var(--bg3)}
+/* ── Sidebar Analytics ── */
+.sb-analytics{padding:14px 14px 0;border-top:1px solid var(--border);margin-top:8px}
+.sb-analytics-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.sb-stat{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid rgba(42,49,71,.5)}
+.sb-stat:last-child{border-bottom:none}
+.sb-stat-label{font-size:11px;color:var(--muted)}
+.sb-stat-val{font-size:12px;font-weight:700;color:var(--text)}
+.sb-mini-bar{height:4px;background:var(--border);border-radius:2px;overflow:hidden;margin-top:3px}
+.sb-mini-fill{height:100%;border-radius:2px;background:var(--accent);transition:width .4s}
+.sb-ring-wrap{display:flex;justify-content:center;padding:10px 0 6px}
 </style>
 </head>
 <body>
@@ -272,9 +345,116 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;mi
     <a class="nav-item <?= $activeSection==='messages'?'active':'' ?>" onclick="showSection('messages')" href="#">
         <i class="fa-solid fa-bell"></i> Notifications
         <?php if($unreadCnt>0): ?><span class="tag tag-amber"><?= $unreadCnt ?></span><?php endif; ?></a>
+    <a class="nav-item <?= in_array($activeSection,['chat'])?'active':'' ?>" onclick="showSection('chat')" href="#">
+        <i class="fa-solid fa-comments"></i> Messages
+        <?php if($totalUnreadMsgS>0): ?><span class="tag tag-blue"><?= $totalUnreadMsgS ?></span><?php endif; ?></a>
     <a class="nav-item <?= $activeSection==='profile'?'active':'' ?>" onclick="showSection('profile')" href="#">
         <i class="fa-solid fa-user"></i> Profile</a>
     <div style="flex:1"></div>
+
+    <?php
+    // ── Sidebar analytics data ─────────────────────────────────
+    $sbTotalHrs = (float)q($conn,"SELECT COALESCE(SUM(hours_covered),0) AS h FROM sessions WHERE student_id=$student_id AND status='completed'")->fetch_assoc()['h'];
+    $sbTDCHrs   = (float)q($conn,"SELECT COALESCE(SUM(s.hours_covered),0) AS h FROM sessions s JOIN appointments a ON a.appointment_id=s.appointment_id JOIN instructor_courses ic ON ic.course_id=a.course_id WHERE s.student_id=$student_id AND s.status='completed' AND ic.course_type LIKE 'TDC%'")->fetch_assoc()['h'];
+    $sbPDCHrs   = max(0, $sbTotalHrs - $sbTDCHrs);
+    $sbTDCPct   = $sbTotalHrs > 0 ? round($sbTDCHrs / $sbTotalHrs * 100) : 0;
+    $sbPDCPct   = 100 - $sbTDCPct;
+    $sbSessions = (int)q($conn,"SELECT COUNT(*) AS c FROM sessions WHERE student_id=$student_id AND status='completed'")->fetch_assoc()['c'];
+    $sbCoursesDone = (int)q($conn,"SELECT COUNT(DISTINCT course_id) AS c FROM appointments WHERE student_id=$student_id AND status='completed'")->fetch_assoc()['c'];
+    $sbThisMonthHrs = (float)q($conn,"SELECT COALESCE(SUM(hours_covered),0) AS h FROM sessions WHERE student_id=$student_id AND status='completed' AND DATE_FORMAT(session_date,'%Y-%m')=DATE_FORMAT(NOW(),'%Y-%m')")->fetch_assoc()['h'];
+    $sbAvgGradeSb = $avgGrade ?? 0;
+    $sbGradeColor = $sbAvgGradeSb >= 80 ? '#3cb97a' : ($sbAvgGradeSb >= 60 ? '#f59e0b' : '#e55');
+    $tdcGoal = 15; $sbTDCProgress = min(100, round($sbTDCHrs / $tdcGoal * 100));
+    ?>
+    <div class="sb-analytics">
+        <div class="sb-analytics-title"><i class="fa-solid fa-chart-pie" style="color:var(--accent)"></i> My Analytics</div>
+
+        <div class="sb-stat">
+            <div>
+                <div class="sb-stat-label">Total Hours</div>
+                <div class="sb-mini-bar" style="width:80px">
+                    <div class="sb-mini-fill" style="width:<?= min(100,$sbTotalHrs/50*100) ?>%"></div>
+                </div>
+            </div>
+            <div class="sb-stat-val" style="color:var(--accent)"><?= $sbTotalHrs ?>h</div>
+        </div>
+
+        <div class="sb-stat">
+            <div>
+                <div class="sb-stat-label">TDC Progress</div>
+                <div class="sb-mini-bar" style="width:80px">
+                    <div class="sb-mini-fill" style="width:<?= $sbTDCProgress ?>%;background:var(--amber)"></div>
+                </div>
+            </div>
+            <div class="sb-stat-val" style="color:var(--amber)"><?= $sbTDCProgress ?>%</div>
+        </div>
+
+        <div class="sb-stat">
+            <div>
+                <div class="sb-stat-label">PDC Hours</div>
+                <div class="sb-mini-bar" style="width:80px">
+                    <div class="sb-mini-fill" style="width:<?= min(100,$sbPDCHrs/8*100) ?>%;background:var(--green)"></div>
+                </div>
+            </div>
+            <div class="sb-stat-val" style="color:var(--green)"><?= $sbPDCHrs ?>h</div>
+        </div>
+
+        <div class="sb-stat">
+            <div class="sb-stat-label">Sessions Done</div>
+            <div class="sb-stat-val"><?= $sbSessions ?></div>
+        </div>
+
+        <div class="sb-stat">
+            <div class="sb-stat-label">This Month</div>
+            <div class="sb-stat-val" style="color:var(--green)"><?= $sbThisMonthHrs ?>h</div>
+        </div>
+
+        <?php if($sbAvgGradeSb): ?>
+        <div class="sb-stat">
+            <div>
+                <div class="sb-stat-label">Avg Grade</div>
+                <div class="sb-mini-bar" style="width:80px">
+                    <div class="sb-mini-fill" style="width:<?= $sbAvgGradeSb ?>%;background:<?= $sbGradeColor ?>"></div>
+                </div>
+            </div>
+            <div class="sb-stat-val" style="color:<?= $sbGradeColor ?>"><?= $sbAvgGradeSb ?></div>
+        </div>
+        <?php endif; ?>
+
+        <div class="sb-stat">
+            <div class="sb-stat-label">Courses Done</div>
+            <div class="sb-stat-val" style="color:var(--green)"><?= $sbCoursesDone ?></div>
+        </div>
+
+        <div style="padding:10px 0 6px">
+            <div class="sb-analytics-title" style="margin-bottom:6px"><i class="fa-solid fa-circle-half-stroke" style="color:var(--muted)"></i> Hours Split</div>
+            <svg viewBox="0 0 80 80" width="80" height="80" style="display:block;margin:0 auto">
+                <?php
+                $r=30; $cx=40; $cy=40;
+                $tdcAngle = $sbTotalHrs > 0 ? ($sbTDCHrs/$sbTotalHrs)*360 : 0;
+                $pdcAngle = 360-$tdcAngle;
+                function svgArc($cx,$cy,$r,$startDeg,$sweepDeg,$color){
+                    if($sweepDeg<=0) return '';
+                    if($sweepDeg>=360) $sweepDeg=359.99;
+                    $s=deg2rad($startDeg-90); $e=deg2rad($startDeg+$sweepDeg-90);
+                    $x1=round($cx+$r*cos($s),2); $y1=round($cy+$r*sin($s),2);
+                    $x2=round($cx+$r*cos($e),2); $y2=round($cy+$r*sin($e),2);
+                    $large=$sweepDeg>180?1:0;
+                    return "<path d='M $cx $cy L $x1 $y1 A $r $r 0 $large 1 $x2 $y2 Z' fill='$color' opacity='.85'/>";
+                }
+                echo svgArc($cx,$cy,$r,0,$tdcAngle,'#f59e0b');
+                echo svgArc($cx,$cy,$r,$tdcAngle,$pdcAngle,'#7c6af7');
+                ?>
+                <circle cx="40" cy="40" r="14" fill="#181c27"/>
+                <text x="40" y="44" text-anchor="middle" font-size="9" fill="#e2e5f0" font-family="Segoe UI"><?= $sbTotalHrs ?>h</text>
+            </svg>
+            <div style="display:flex;gap:8px;justify-content:center;margin-top:4px;font-size:10px;color:var(--muted)">
+                <span style="color:#f59e0b">● TDC <?= $sbTDCHrs ?>h</span>
+                <span style="color:#7c6af7">● PDC <?= $sbPDCHrs ?>h</span>
+            </div>
+        </div>
+    </div>
+
     <a class="nav-item" href="student_logout.php"><i class="fa-solid fa-sign-out-alt"></i> Logout</a>
 </div>
 
@@ -348,6 +528,45 @@ $avgGrade = q($conn,"SELECT ROUND(AVG(grade),1) AS ag FROM sessions WHERE studen
     <?php endwhile; endif; ?>
     </tbody></table>
 </div>
+
+<!-- ══ STUDENT ANALYTICS CHARTS ═══════════════════════════════ -->
+<div style="font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin:20px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--border)">
+    <i class="fa-solid fa-chart-line me-2" style="color:var(--accent)"></i>My Learning Analytics
+</div>
+<div class="duo-grid" style="margin-bottom:16px">
+    <div class="panel">
+        <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-chart-bar me-1"></i> TDC vs PDC Hours – Last 6 Months</div></div>
+        <div style="padding:16px;height:200px;position:relative"><canvas id="stuChartHours"></canvas></div>
+    </div>
+    <div class="panel">
+        <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-chart-pie me-1"></i> Training Progress</div></div>
+        <div style="padding:16px;display:flex;align-items:center;gap:16px;height:200px">
+            <div style="flex:0 0 150px;height:150px;position:relative"><canvas id="stuChartProgress"></canvas></div>
+            <div style="flex:1;font-size:12px;display:flex;flex-direction:column;gap:10px">
+                <div>
+                    <div style="color:var(--amber);font-weight:700;font-size:18px"><?= $sbTDCHrsPre ?>/15h</div>
+                    <div style="color:var(--muted);font-size:11px">TDC Progress (<?= $sbTDCProgressPre ?>%)</div>
+                    <div style="height:4px;background:var(--border);border-radius:2px;margin-top:4px"><div style="height:4px;background:var(--amber);border-radius:2px;width:<?= $sbTDCProgressPre ?>%"></div></div>
+                </div>
+                <div>
+                    <div style="color:var(--green);font-weight:700;font-size:18px"><?= $sbPDCHrsPre ?>h</div>
+                    <div style="color:var(--muted);font-size:11px">PDC Hours Completed</div>
+                </div>
+                <div>
+                    <div style="color:var(--accent);font-weight:700;font-size:18px"><?= $sbSessionsPre ?></div>
+                    <div style="color:var(--muted);font-size:11px">Total Sessions Done</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+<?php if(count($stuGradeTrend)>=2): ?>
+<div class="panel" style="margin-bottom:16px">
+    <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-chart-line me-1"></i> My Grade Trend (Recent Sessions)</div></div>
+    <div style="padding:16px;height:180px;position:relative"><canvas id="stuChartGrades"></canvas></div>
+</div>
+<?php endif; ?>
+
 </div>
 
 <!-- ══ BROWSE INSTRUCTORS ═════════════════════════════════════ -->
@@ -663,27 +882,125 @@ $overallGrade=q($conn,"SELECT tdc_overall_grade FROM appointments a JOIN instruc
 </div>
 </div>
 
+<!-- ══ CHAT / MESSAGING ════════════════════════════════════════ -->
+<div id="section-chat" class="section <?= in_array($activeSection,['chat'])?'active':'' ?>">
+<?php
+// Build unique instructor map
+$instrMap=[];
+$myInstructors->data_seek(0);
+while($mi=$myInstructors->fetch_assoc()){
+    $iid=(int)$mi['instructor_id'];
+    if(!isset($instrMap[$iid])) $instrMap[$iid]=$mi;
+}
+?>
+<div style="display:flex;gap:16px;height:calc(100vh - 160px);min-height:400px">
+<!-- Left: instructor list -->
+<div style="width:240px;flex-shrink:0;background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow-y:auto">
+    <div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.06em">My Instructors</div>
+    <?php if(empty($instrMap)): ?>
+    <div style="padding:20px;text-align:center;color:var(--muted);font-size:12px">No enrolled instructors yet.</div>
+    <?php else: foreach($instrMap as $iid=>$mi):
+        $unread=$unreadMsgMapS[$iid]??0;
+        $isActive=($chatInstrId===$iid);
+    ?>
+    <a href="<?= $selfFile ?>?section=chat&chat_instr=<?= $iid ?>"
+       style="display:flex;align-items:center;gap:10px;padding:10px 14px;text-decoration:none;border-bottom:1px solid var(--border);background:<?= $isActive?'rgba(124,106,247,.12)':'transparent' ?>;transition:.15s"
+       onmouseover="this.style.background='rgba(124,106,247,.08)'" onmouseout="this.style.background='<?= $isActive?'rgba(124,106,247,.12)':'transparent' ?>'">
+        <div style="width:34px;height:34px;border-radius:50%;background:var(--green);display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff;flex-shrink:0"><?= strtoupper(substr($mi['fullname'],0,1)) ?></div>
+        <div style="flex:1;min-width:0">
+            <div style="font-size:12px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><?= htmlspecialchars($mi['fullname']) ?></div>
+            <div style="font-size:10px;color:var(--muted)"><?= htmlspecialchars($mi['course_type']) ?></div>
+        </div>
+        <?php if($unread>0): ?><span class="tag tag-blue" style="font-size:10px;padding:1px 6px"><?= $unread ?></span><?php endif; ?>
+    </a>
+    <?php endforeach; endif; ?>
+</div>
+<!-- Right: conversation -->
+<div style="flex:1;display:flex;flex-direction:column;background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden">
+<?php if($chatInstrId>0&&isset($instrMap[$chatInstrId])):
+    $cInstr=$instrMap[$chatInstrId];
+    // Mark incoming messages as read
+    $conn->query("UPDATE messages SET is_read=1 WHERE receiver_id=$student_id AND receiver_type='student' AND sender_id=$chatInstrId AND sender_type='instructor'");
+    $convRes=q($conn,"SELECT * FROM messages WHERE (sender_id=$student_id AND sender_type='student' AND receiver_id=$chatInstrId AND receiver_type='instructor') OR (sender_id=$chatInstrId AND sender_type='instructor' AND receiver_id=$student_id AND receiver_type='student') ORDER BY created_at ASC");
+?>
+<div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">
+    <div style="width:32px;height:32px;border-radius:50%;background:var(--green);display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff"><?= strtoupper(substr($cInstr['fullname'],0,1)) ?></div>
+    <div>
+        <div style="font-size:13px;font-weight:600"><?= htmlspecialchars($cInstr['fullname']) ?></div>
+        <div style="font-size:10px;color:var(--muted)"><?= htmlspecialchars($cInstr['course_type']) ?> &bull; <?= ucfirst($cInstr['status']) ?></div>
+    </div>
+</div>
+<div style="flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px" id="msg-thread">
+    <?php if($convRes->num_rows===0): ?>
+    <div style="text-align:center;color:var(--muted);font-size:12px;margin:auto">No messages yet. Say hello!</div>
+    <?php else: while($cv=$convRes->fetch_assoc()):
+        $isMine=$cv['sender_type']==='student'; ?>
+    <div style="display:flex;justify-content:<?= $isMine?'flex-end':'flex-start' ?>">
+        <div style="max-width:72%;background:<?= $isMine?'var(--accent)':'var(--bg3)' ?>;color:<?= $isMine?'#fff':'var(--text)' ?>;padding:8px 12px;border-radius:<?= $isMine?'14px 14px 4px 14px':'14px 14px 14px 4px' ?>;font-size:12px;line-height:1.5">
+            <?= nl2br(htmlspecialchars($cv['body'])) ?>
+            <div style="font-size:9px;opacity:.65;margin-top:4px;text-align:right"><?= date('M d, g:i A',strtotime($cv['created_at'])) ?></div>
+        </div>
+    </div>
+    <?php endwhile; endif; ?>
+</div>
+<form method="POST" style="padding:12px 16px;border-top:1px solid var(--border);display:flex;gap:8px">
+    <input type="hidden" name="action" value="send_message_student">
+    <input type="hidden" name="to_instructor_id" value="<?= $chatInstrId ?>">
+    <input type="hidden" name="appointment_id" value="<?= $cInstr['appointment_id']??0 ?>">
+    <textarea name="body" class="di" rows="1" placeholder="Type a message…" required style="flex:1;resize:none;height:38px;padding:8px 12px" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();this.form.submit();}"></textarea>
+    <button type="submit" class="be" style="height:38px;padding:0 16px"><i class="fa-solid fa-paper-plane"></i></button>
+</form>
+<?php else: ?>
+<div style="flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;color:var(--muted)">
+    <i class="fa-solid fa-comments" style="font-size:36px;opacity:.3"></i>
+    <div style="font-size:13px">Select an instructor to start a conversation</div>
+</div>
+<?php endif; ?>
+</div>
+</div>
+</div>
+
 <!-- ══ PROFILE ════════════════════════════════════════════════ -->
 <div id="section-profile" class="section <?= $activeSection==='profile'?'active':'' ?>">
 <?php
 $hasCertNow=(int)q($conn,"SELECT COUNT(*) AS c FROM tdc_certificates WHERE student_id=$student_id")->fetch_assoc()['c'];
+$hasPdcCertNow=(int)q($conn,"SELECT COUNT(*) AS c FROM pdc_certificates WHERE student_id=$student_id")->fetch_assoc()['c'];
+$idPhotoPath='../assets/uploads/student_ids/';
 ?>
 <div class="panel mb-3">
     <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-user"></i> My Profile</div></div>
-    <div style="padding:20px;display:flex;gap:16px;align-items:center">
-        <div style="width:60px;height:60px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:700;color:#fff;flex-shrink:0"><?= strtoupper(substr($student['fullname'],0,1)) ?></div>
-        <div>
+    <div style="padding:20px;display:flex;gap:20px;align-items:center;flex-wrap:wrap">
+        <!-- Avatar -->
+        <div style="width:70px;height:70px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:700;color:#fff;flex-shrink:0"><?= strtoupper(substr($student['fullname'],0,1)) ?></div>
+        <div style="flex:1;min-width:200px">
             <div style="font-size:18px;font-weight:700"><?= htmlspecialchars($student['fullname']) ?></div>
             <div style="font-size:12px;color:var(--muted)"><?= htmlspecialchars($student['email']) ?></div>
+            <?php if(!empty($student['gender'])): ?>
+            <div style="font-size:11px;color:var(--muted);margin-top:2px"><i class="fa-solid fa-<?= $student['gender']==='Male'?'mars':'venus' ?> me-1"></i><?= htmlspecialchars($student['gender']) ?></div>
+            <?php endif; ?>
             <div style="font-size:11px;color:var(--muted);margin-top:2px">Member since <?= date('F Y',strtotime($student['created_at'])) ?></div>
-            <?php if($hasCertNow): ?><div style="margin-top:8px"><span class="cert-badge"><i class="fa-solid fa-certificate"></i> TDC Certificate Holder</span></div><?php endif; ?>
+            <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+                <?php if($hasCertNow): ?><span class="cert-badge"><i class="fa-solid fa-certificate"></i> TDC Cert</span><?php endif; ?>
+                <?php if($hasPdcCertNow): ?><span class="cert-badge" style="background:rgba(59,185,122,.12);border-color:rgba(59,185,122,.3);color:var(--green)"><i class="fa-solid fa-certificate"></i> PDC Cert</span><?php endif; ?>
+                <?php if(!empty($student['fb_link'])): ?><a href="<?= htmlspecialchars($student['fb_link']) ?>" target="_blank" style="font-size:11px;color:#60a5fa;text-decoration:none"><i class="fa-brands fa-facebook me-1"></i>Facebook</a><?php endif; ?>
+            </div>
         </div>
+        <!-- ID Photo preview -->
+        <?php if(!empty($student['id_photo'])&&file_exists($idPhotoPath.$student['id_photo'])): ?>
+        <div style="text-align:center">
+            <div style="font-size:10px;color:var(--muted);margin-bottom:6px">National ID / Valid ID</div>
+            <img src="<?= $idPhotoPath.htmlspecialchars($student['id_photo']) ?>" alt="ID Photo"
+                 style="max-width:160px;max-height:100px;border-radius:8px;border:1px solid var(--border);object-fit:cover;cursor:pointer"
+                 onclick="window.open(this.src,'_blank')">
+        </div>
+        <?php endif; ?>
     </div>
 </div>
+
 <div class="panel">
     <div class="panel-head"><div class="panel-title"><i class="fa-solid fa-pen"></i> Edit Profile</div></div>
     <div style="padding:20px">
-    <form method="POST">
+    <form method="POST" enctype="multipart/form-data">
         <input type="hidden" name="action" value="update_profile">
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
             <div>
@@ -702,9 +1019,44 @@ $hasCertNow=(int)q($conn,"SELECT COUNT(*) AS c FROM tdc_certificates WHERE stude
                 <label class="form-label">Address</label>
                 <input type="text" name="address" class="di" value="<?= htmlspecialchars($student['address']??'') ?>" placeholder="City, Province">
             </div>
+            <div>
+                <label class="form-label">Gender</label>
+                <div style="display:flex;gap:10px;margin-top:6px">
+                    <?php foreach(['Male','Female','Other'] as $g): ?>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+                        <input type="radio" name="gender" value="<?= $g ?>" style="accent-color:var(--accent)"
+                            <?= ($student['gender']??'')===$g?'checked':'' ?>>
+                        <i class="fa-solid fa-<?= $g==='Male'?'mars':($g==='Female'?'venus':'genderless') ?>" style="color:<?= $g==='Male'?'#60a5fa':($g==='Female'?'#f472b6':'var(--muted)') ?>"></i>
+                        <?= $g ?>
+                    </label>
+                    <?php endforeach; ?>
+                </div>
+            </div>
+            <div>
+                <label class="form-label"><i class="fa-brands fa-facebook me-1" style="color:#60a5fa"></i>Facebook Profile Link</label>
+                <input type="url" name="fb_link" class="di" value="<?= htmlspecialchars($student['fb_link']??'') ?>" placeholder="https://facebook.com/yourprofile">
+            </div>
         </div>
-        <button type="submit" class="be"><i class="fa-solid fa-save"></i> Save Profile</button>
-        <span style="font-size:11px;color:var(--muted);margin-left:12px">To change password, use Forgot Password on the login page.</span>
+
+        <!-- ID Photo upload -->
+        <div style="margin-bottom:16px;padding:16px;background:var(--bg3);border-radius:8px;border:1px solid var(--border)">
+            <label class="form-label" style="margin-bottom:8px"><i class="fa-solid fa-id-card me-1" style="color:var(--amber)"></i>National ID / Valid Government ID Photo</label>
+            <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Upload a clear photo of your valid government ID (e.g. PhilSys, Driver's License, Passport, UMID). Accepted: JPG, PNG, WEBP.</div>
+            <input type="file" name="id_photo" class="di" accept="image/*" style="margin-bottom:8px">
+            <?php if(!empty($student['id_photo'])&&file_exists($idPhotoPath.$student['id_photo'])): ?>
+            <div style="margin-top:8px;display:flex;align-items:center;gap:10px">
+                <img src="<?= $idPhotoPath.htmlspecialchars($student['id_photo']) ?>" style="height:50px;border-radius:6px;border:1px solid var(--border)">
+                <span style="font-size:11px;color:var(--green)"><i class="fa-solid fa-check me-1"></i>ID photo on file — upload new to replace</span>
+            </div>
+            <?php else: ?>
+            <div style="font-size:11px;color:var(--muted)"><i class="fa-solid fa-triangle-exclamation me-1" style="color:var(--amber)"></i>No ID photo uploaded yet</div>
+            <?php endif; ?>
+        </div>
+
+        <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+            <button type="submit" class="be"><i class="fa-solid fa-save"></i> Save Profile</button>
+            <span style="font-size:11px;color:var(--muted)">To change password, use Forgot Password on the login page.</span>
+        </div>
     </form>
     </div>
 </div>
@@ -774,9 +1126,43 @@ $hasCertNow=(int)q($conn,"SELECT COUNT(*) AS c FROM tdc_certificates WHERE stude
     </form>
 </div></div>
 
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script>
+var stuChartsOk=false;
+function initStuCharts(){
+    if(stuChartsOk||typeof Chart==='undefined') return;
+    stuChartsOk=true;
+    var cs=getComputedStyle(document.documentElement);
+    var accent=cs.getPropertyValue('--accent').trim()||'#7c6af7';
+    var green=cs.getPropertyValue('--green').trim()||'#3cb97a';
+    var amber=cs.getPropertyValue('--amber').trim()||'#f59e0b';
+    var red=cs.getPropertyValue('--red').trim()||'#e55555';
+    var border=cs.getPropertyValue('--border').trim()||'#2a3147';
+    var bg=cs.getPropertyValue('--bg').trim()||'#0f1117';
+    var muted=cs.getPropertyValue('--muted').trim()||'#8490a8';
+    Chart.defaults.color=muted; Chart.defaults.font.family='Segoe UI,sans-serif'; Chart.defaults.font.size=11;
+
+    // 1) Stacked TDC/PDC hours per month
+    var c1=document.getElementById('stuChartHours');
+    if(c1){new Chart(c1,{type:'bar',data:{labels:<?= json_encode($stuMonths) ?>,datasets:[{label:'TDC hrs',data:<?= json_encode($stuTDCHrsMonth) ?>,backgroundColor:amber+'cc',borderRadius:3,stack:'s'},{label:'PDC hrs',data:<?= json_encode($stuPDCHrsMonth) ?>,backgroundColor:green+'cc',borderRadius:3,stack:'s'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{boxWidth:10,padding:10}}},scales:{x:{grid:{color:border+'44'},stacked:true},y:{grid:{color:border+'44'},beginAtZero:true,stacked:true}}}});}
+
+    // 2) Progress doughnut
+    var c2=document.getElementById('stuChartProgress');
+    if(c2){new Chart(c2,{type:'doughnut',data:{labels:['TDC Done','TDC Left','PDC'],datasets:[{data:[<?= $sbTDCHrsPre ?>,<?= max(0,15-$sbTDCHrsPre) ?>,<?= $sbPDCHrsPre ?>],backgroundColor:[amber+'cc',border,green+'cc'],borderColor:bg,borderWidth:3,hoverOffset:4}]},options:{responsive:true,maintainAspectRatio:false,cutout:'62%',plugins:{legend:{display:false}}}});}
+
+    // 3) Grade trend line
+    var c3=document.getElementById('stuChartGrades');
+    if(c3){
+        var gData=<?= json_encode($stuGradeTrend) ?>;
+        var gLabels=<?= json_encode($stuGradeLabels) ?>;
+        var gcColors=gData.map(function(g){return g>=80?green:g>=60?amber:red;});
+        new Chart(c3,{type:'line',data:{labels:gLabels,datasets:[{label:'Grade',data:gData,borderColor:accent,backgroundColor:accent+'22',fill:true,tension:0.3,pointBackgroundColor:gcColors,pointRadius:5,pointHoverRadius:7}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:border+'44'}},y:{grid:{color:border+'44'},min:0,max:100,ticks:{callback:function(v){return v+'/100';}}}}}});
+    }
+}
+(function(){ if(document.querySelector('#section-dashboard.active')) setTimeout(initStuCharts,120); })();
+
 const T={dashboard:'Dashboard',instructors:'Browse Instructors',view_instr:'Instructor Profile',
-  my_appointments:'My Appointments',progress:'My Progress',messages:'Notifications',profile:'Profile'};
+  my_appointments:'My Appointments',progress:'My Progress',messages:'Notifications',chat:'Messages',profile:'Profile'};
 
 function showSection(n){
     document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));
@@ -791,6 +1177,7 @@ function showSection(n){
     u.searchParams.set('section',n);
     if(n!=='view_instr')u.searchParams.delete('view_instr');
     window.history.pushState({},'',u);
+    if(n==='dashboard') setTimeout(initStuCharts,80);
 }
 
 function viewInstructor(id){
@@ -839,6 +1226,12 @@ function closeRateModal(){document.getElementById('rateModal').style.display='no
 ['bookModal','rateModal'].forEach(id=>{
     document.getElementById(id).addEventListener('click',function(e){if(e.target===this)this.style.display='none';});
 });
+// Auto-scroll chat thread to bottom
+(function(){
+    var t=document.getElementById('msg-thread');
+    if(t) t.scrollTop=t.scrollHeight;
+})();
+
 </script>
 </body>
 </html>
