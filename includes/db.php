@@ -3,7 +3,7 @@
 $host = "localhost";
 $user = "root";
 $password = "";
-$database = "abrot";
+$database = "digitrack_1";
 
 $conn = new mysqli($host, $user, $password, $database);
 
